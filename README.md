@@ -233,8 +233,8 @@ Unlike Penelope (from [1984](https://github.com/ariannamethod/1984)) which takes
 The foundational module. Char-level (VOCAB=256) with all three attention mechanisms in fluid hybrid. Full Calendar Drift, AML physics, Dario equation, Chuck optimizer, dual weight matrices, 12 bi-directional steps, Kuramoto chambers, MetaJanus birth snapshot, GGUF spore export.
 
 ```
-Architecture: T=64, E=128, H=4, D=32, B=6, M=256
-Parameters:   ~1.45M × 2 matrices = ~2.9M total
+Architecture: T=256, E=288, H=6, D=48, B=6, M=768
+Parameters:   ~9.85M × 2 matrices = ~19.7M total
 Training:     char-level next-character prediction
 Output:       char-level generation
 ```
@@ -252,7 +252,7 @@ The architectural pressure variant. Trains on BPE tokens (subword units, 512 voc
 ```
 Training:     BPE tokens → next-BPE prediction (512 vocab)
 Output:       char-level generation (256 vocab) — THE PRESSURE
-Parameters:   ~1.52M × 2 matrices
+Parameters:   ~10.5M × 2 matrices
 ```
 
 The pressure forces each character to be precise — the model's conceptual (BPE) understanding must compress through a char-level bottleneck.
@@ -267,7 +267,7 @@ Pure BPE version — BPE in, BPE out. No char-level pressure. Same hybrid attent
 
 ```
 Training/Output: BPE tokens (512 vocab)
-Parameters:      ~1.52M × 2 matrices
+Parameters:      ~10.5M × 2 matrices
 ```
 
 ```bash
@@ -282,7 +282,7 @@ Also features enhanced MetaJanus with internal prophecy: predicts expected entro
 
 ```
 Attention:    Janus only (echo through own weights)
-Parameters:   ~960K × 2 matrices
+Parameters:   ~6.8M × 2 matrices
 Output:       char-level
 ```
 
@@ -293,60 +293,97 @@ cc metajanus.c -O2 -lm -o metajanus
 ```
 
 ### `nanojanus.html` — Browser Version
-Web-based NanoJanus, styled after [Penelope](https://github.com/ariannamethod/1984). Word-level output with BPE-like internal embeddings. Dark theme with color-coded bi-directional steps (orange ↑ backward, blue ↓ forward, gold ● origin).
+Web-based NanoJanus, styled after [Penelope](https://github.com/ariannamethod/1984). Word-level output with dual tokenizer (BPE-like internal embeddings + word-level output). 1984-word vocabulary loaded from `nanojanus.txt` (with inline fallback). Dark theme with color-coded bi-directional steps (orange ↑ backward, blue ↓ forward, gold ● origin).
 
 Features:
+- 1984-word vocabulary (matching Penelope's count from [1984](https://github.com/ariannamethod/1984))
+- 3-stage dual tokenizer: exact match → suffix stemming → greedy BPE decomposition
+- Vocabulary loaded from `nanojanus.txt` (async fetch, falls back to inline array for file:// protocol)
 - Interactive text input
-- In-browser training on pasted text
+- In-browser training on pasted text (2000 steps, word-level prediction)
 - Calendar Drift computed in real-time
 - MetaJanus birth snapshot on page load
 - Kuramoto chambers + Dario equation
 - Dual weight matrices blended by calendar state
 - 12 bi-directional reasoning steps visualized
 
-Open `nanojanus.html` in any modern browser. No server needed.
+Open `nanojanus.html` in any modern browser. No server needed for the inline fallback; serve with any HTTP server (e.g. `python3 -m http.server`) for nanojanus.txt loading.
+
+### `nanojanus.py` — Python Version
+Python port of nanojanus with identical architecture. CLI-based with `--generate` and `--train` modes.
+
+```bash
+python3 nanojanus.py --generate "the darkness of void"
+python3 nanojanus.py --train shakespeare.txt
+```
+
+Features:
+- Loads vocabulary from `nanojanus.txt` (1984 words)
+- Same 3-stage tokenizer (exact → stem → greedy BPE decomposition)
+- All AML physics, Calendar Drift, MetaJanus, Kuramoto chambers, dual matrices
+- 12 bi-directional reasoning steps with formatted terminal output
+- Training with Chuck-like optimizer modulation
+- Save/load weights via pickle (`nanojanus.weights.pkl`)
+
+### `nanojanus.txt` — Vocabulary File
+1984 words organized in 29 semantic categories (body, nature, emotion, time, society, abstract, action, material, food, architecture, relationship, philosophy, music, weather, ritual, labor, geometry, animal, textile, transport, domestic, communication, medical, cosmic, bureaucracy, mythic, textual, psychological, final stratum). One word per line.
+
+Used by both `nanojanus.html` and `nanojanus.py`. The word count (1984) matches [Penelope](https://github.com/ariannamethod/1984) — a deliberate design choice.
 
 ## Parameter Calculations
 
 For janus.c (char-level, ~1.2MB Shakespeare dataset):
 
 ```
-Token embedding:    256 × 128          = 32,768
-Position embedding: 64 × 128           = 8,192
+Token embedding:    256 × 288          = 73,728
+Position embedding: 256 × 288          = 73,728
 
 Per block (×6):
-  RMSNorm:         128                 = 128
-  Q,K,V weights:   3 × 4 × 128 × 32   = 49,152
-  RRPRAM Wr:       4 × 128 × 64        = 32,768
-  RRPRAM Vr:       4 × 128 × 32        = 16,384
-  Janus Wj:        128 × 128           = 16,384
-  Hybrid gates:    4 × 3               = 12
-  Output Wo:       128 × 128           = 16,384
-  RMSNorm:         128                 = 128
-  SwiGLU gate:     128 × 256           = 32,768
-  SwiGLU up:       128 × 256           = 32,768
-  SwiGLU down:     256 × 128           = 32,768
-  Block total:                         = 229,634
-  ×6 blocks:                           = 1,377,804
+  RMSNorm:         288                 = 288
+  Q,K,V weights:   3 × 6 × 288 × 48   = 248,832
+  RRPRAM Wr:       6 × 288 × 256       = 442,368
+  RRPRAM Vr:       6 × 288 × 48        = 82,944
+  Janus Wj:        288 × 288           = 82,944
+  Hybrid gates:    6 × 3               = 18
+  Output Wo:       288 × 288           = 82,944
+  RMSNorm:         288                 = 288
+  SwiGLU gate:     288 × 768           = 221,184
+  SwiGLU up:       288 × 768           = 221,184
+  SwiGLU down:     768 × 288           = 221,184
+  Block total:                         = 1,604,178
+  ×6 blocks:                           = 9,625,068
 
-Final RMSNorm:     128                 = 128
-Output projection: 128 × 256           = 32,768
+Final RMSNorm:     288                 = 288
+Output projection: 288 × 256           = 73,728
 
-Single matrix total:                   ≈ 1,451,660 params
-Dual matrices:     × 2                 ≈ 2,903,320 params
-Model file (f32):                      ≈ 11.6 MB
+Single matrix total:                   ≈ 9,846,540 params (~9.85M)
+Dual matrices:     × 2                 ≈ 19,693,080 params (~19.7M)
+Model file (f32):                      ≈ 78.8 MB
 ```
+
+This scaling follows the same ratio as [Dubrovsky](https://github.com/ariannamethod/dubrovsky) (9.5M params for ~1.17MB dataset), appropriate for ~1MB Shakespeare-scale training data.
 
 ## Building
 
-All modules are zero-dependency C (only libc + libm):
+All C modules are zero-dependency C (only libc + libm):
 
 ```bash
-# Build all
+# Build all C modules
 cc janus.c -O2 -lm -o janus
 cc janus-hybrid.c -O2 -lm -o janus-hybrid
 cc janus-bpe.c -O2 -lm -o janus-bpe
 cc metajanus.c -O2 -lm -o metajanus
+
+# Python version (no build needed)
+python3 nanojanus.py --generate "speak to janus"
+python3 nanojanus.py --train data.txt
+
+# Browser version
+# Option 1: Open directly (uses inline vocabulary fallback)
+open nanojanus.html
+# Option 2: Serve for nanojanus.txt loading
+python3 -m http.server 8080
+# Then open http://localhost:8080/nanojanus.html
 ```
 
 ## References
