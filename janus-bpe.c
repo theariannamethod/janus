@@ -201,7 +201,7 @@ static void matmul(float*C,const float*A,const float*B,int m,int k,int n){
 }
 static void matmul_atb(float*C,const float*A,const float*B,int m,int k,int n){
     for(int i=0;i<m;i++) for(int j=0;j<n;j++){
-        float s=0; for(int p=0;p<k;p++) s+=A[p*m+i]*B[p*n+j]; C[i*n+j]=s;
+        float s=0; for(int p=0;p<k;p++) s+=A[p*m+i]*B[p*n+j]; C[i*n+j]+=s;
     }
 }
 static void matmul_abt(float*C,const float*A,const float*B,int m,int k,int n){
@@ -440,6 +440,21 @@ static void backward(Ptrs*w,Ptrs*g,Acts*a,int*tok,int*tgt,int T){
         float inv=1/sqrtf(ss/DIM+1e-5f);for(int e=0;e<DIM;e++)dc[t*DIM+e]+=dr[t*DIM+e]*w->rms2[b][e]*inv;}
         float*da=calloc(T*DIM,4);memcpy(da,dc,T*DIM*4);
         matmul_atb(g->wo[b],a->cat,da,DIM,T,DIM);
+        /* BUG 1 FIX: propagate attention gradient through RMSNorm1 back to cur */
+        float*d_cat=calloc(T*DIM,4);
+        matmul_abt(d_cat,da,w->wo[b],T,DIM,DIM); /* d_cat = da @ wo^T */
+        /* RMSNorm1 backward: input = cur at start of this block.
+           For b==0 it's a->x. For b>0, cur = r1 - ao (since r1 = cur + ao). */
+        for(int t=0;t<T;t++){
+            /* Reconstruct cur for this block: r1 = cur + ao, so cur = r1 - ao */
+            float inp[DIM]; /* stack buffer for one timestep */
+            if(b==0) { for(int e=0;e<DIM;e++) inp[e]=a->x[t*DIM+e]; }
+            else { for(int e=0;e<DIM;e++) inp[e]=a->r1[t*DIM+e]-a->ao[t*DIM+e]; }
+            float ss=0;for(int e=0;e<DIM;e++) ss+=inp[e]*inp[e];
+            float inv=1/sqrtf(ss/DIM+1e-5f);
+            for(int e=0;e<DIM;e++) dc[t*DIM+e]+=d_cat[t*DIM+e]*w->rms1[b][e]*inv;
+        }
+        free(d_cat);
         if(b==0) for(int t=0;t<T;t++) for(int e=0;e<DIM;e++){
             g->tok_emb[tok[t]*DIM+e]+=dc[t*DIM+e]; g->pos_emb[t*DIM+e]+=dc[t*DIM+e];}
         free(dm);free(ds);free(dg2);free(du);free(dr);free(tmp);free(da);
@@ -527,6 +542,7 @@ static void display(RStep*steps,int n){
 }
 
 /* Training */
+#define GRAD_ACCUM 32
 static void train_bpe(DualModel*dm,const char*path,int max_steps,float lr){
     FILE*f=fopen(path,"r");if(!f){fprintf(stderr,"cannot open %s\n",path);return;}
     fseek(f,0,SEEK_END);long fsz=ftell(f);fseek(f,0,SEEK_SET);
@@ -539,18 +555,27 @@ static void train_bpe(DualModel*dm,const char*path,int max_steps,float lr){
     Acts a;acts_alloc(&a);int T=MAX_T;int*tok=malloc(T*4),*tgt=malloc(T*4);
     printf("[janus-bpe] %ld bytes → %d tokens\n",fsz,bl);
     printf("[janus-bpe] params: %d (%.2fMB) × 2 matrices\n",dm->A.n_params,dm->A.n_params*4.0f/1e6f);
-    printf("[janus-bpe] Chuck optimizer, %d steps, lr=%.1e\n",max_steps,lr);
+    printf("[janus-bpe] Chuck optimizer, %d steps, lr=%.1e, grad_accum=%d\n",max_steps,lr,GRAD_ACCUM);
     float best=1e9f;clock_t t0=clock();
     for(int step=1;step<=max_steps;step++){
         Model*act=(step%2)?&dm->A:&dm->B;
-        int off=rand()%(bl-T-1);
-        for(int t=0;t<T;t++){tok[t]=bd[off+t]%BPE_VOCAB;tgt[t]=bd[off+t+1]%BPE_VOCAB;}
-        float loss=forward(&act->w,&a,tok,tgt,T);
-        backward(&act->w,&act->g,&a,tok,tgt,T);
-        chuck_observe(loss);chuck_update(act->data,act->grad,act->cm,act->cv,act->n_params,lr);
-        if(loss<best)best=loss;
+        memset(act->grad,0,act->n_params*sizeof(float));
+        float step_loss=0;
+        for(int ga=0;ga<GRAD_ACCUM;ga++){
+            int off=rand()%(bl-T-1);
+            for(int t=0;t<T;t++){tok[t]=bd[off+t]%BPE_VOCAB;tgt[t]=bd[off+t+1]%BPE_VOCAB;}
+            float loss=forward(&act->w,&a,tok,tgt,T);
+            backward(&act->w,&act->g,&a,tok,tgt,T);
+            step_loss+=loss;
+        }
+        step_loss/=GRAD_ACCUM;
+        /* Scale gradients by 1/GRAD_ACCUM to average */
+        float inv_ga=1.0f/GRAD_ACCUM;
+        for(int i=0;i<act->n_params;i++) act->grad[i]*=inv_ga;
+        chuck_observe(step_loss);chuck_update(act->data,act->grad,act->cm,act->cv,act->n_params,lr);
+        if(step_loss<best)best=step_loss;
         if(step%100==0||step==1){float el=(float)(clock()-t0)/CLOCKS_PER_SEC;
-        printf("  step %5d/%d  loss=%.4f  best=%.4f  %.1f s/s\n",step,max_steps,loss,best,step/(el+1e-6f));}
+        printf("  step %5d/%d  loss=%.4f  best=%.4f  %.1f s/s\n",step,max_steps,step_loss,best,step/(el+1e-6f));}
     }
     printf("[janus-bpe] done. best=%.4f\n",best);
     acts_free(&a);free(bd);free(tok);free(tgt);

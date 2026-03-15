@@ -731,15 +731,60 @@ static void backward_pass(Ptrs *w, Ptrs *g, Acts *a, int *tokens, int *targets,
         memcpy(d_attn, d_cur, T*DIM*sizeof(float));
         matmul_atb(g->wo[b], a->cat, d_attn, DIM, T, DIM);
 
+        /* d_cat: d_attn @ wo^T */
+        float *d_cat = calloc(T*DIM, sizeof(float));
+        matmul_abt(d_cat, d_attn, w->wo[b], T, DIM, DIM);
+
+        /* Distribute d_cat to per-head weight gradients + accumulate d_rm1 */
+        int D = HEAD_DIM;
+        float *d_rm1 = calloc(T*DIM, sizeof(float));
+        for (int h = 0; h < HEADS; h++) {
+            float gl[3] = { w->gate[b][h*3], w->gate[b][h*3+1], w->gate[b][h*3+2] };
+            row_softmax(gl, 3);
+            float ga = gl[0];
+            for (int t = 0; t < T; t++)
+                for (int d = 0; d < D; d++) {
+                    float dc = d_cat[t*DIM + h*D + d] * ga;
+                    for (int e = 0; e < DIM; e++) {
+                        g->wv[b][h*DIM*D + e*D + d] += dc * a->rm1[t*DIM+e] / T;
+                        d_rm1[t*DIM+e] += dc * w->wv[b][h*DIM*D + e*D + d];
+                    }
+                }
+            float gb = gl[1];
+            for (int t = 0; t < T; t++)
+                for (int d = 0; d < D; d++) {
+                    float dc = d_cat[t*DIM + h*D + d] * gb;
+                    for (int e = 0; e < DIM; e++) {
+                        g->wvr[b][h*DIM*D + e*D + d] += dc * a->rm1[t*DIM+e] / T;
+                        d_rm1[t*DIM+e] += dc * w->wvr[b][h*DIM*D + e*D + d];
+                    }
+                }
+        }
+
+        /* RMSNorm1 backward: propagate d_rm1 through norm to block input */
         float *input = (b == 0) ? a->x : a->r2;
-        for (int t = 0; t < T; t++)
+        for (int t = 0; t < T; t++) {
+            float ss = 0;
+            for (int e = 0; e < DIM; e++) ss += input[t*DIM+e]*input[t*DIM+e];
+            float inv = 1.0f / sqrtf(ss/DIM + 1e-5f);
             for (int e = 0; e < DIM; e++) {
-                g->tok_emb[tokens[t]*DIM+e] += d_cur[t*DIM+e] * (b==0 ? 1.0f : 0.0f);
-                g->pos_emb[t*DIM+e] += d_cur[t*DIM+e] * (b==0 ? 1.0f : 0.0f);
+                d_cur[t*DIM+e] += d_rm1[t*DIM+e] * w->rms1[b][e] * inv;
+                g->rms1[b][e] += d_rm1[t*DIM+e] * input[t*DIM+e] * inv;
             }
+        }
+        free(d_rm1);
+
+        /* Embedding gradient (block 0 only) */
+        if (b == 0) {
+            for (int t = 0; t < T; t++)
+                for (int e = 0; e < DIM; e++) {
+                    g->tok_emb[tokens[t]*DIM+e] += d_cur[t*DIM+e];
+                    g->pos_emb[t*DIM+e] += d_cur[t*DIM+e];
+                }
+        }
 
         free(d_mlp); free(d_swi); free(d_gate); free(d_up);
-        free(d_rm2); free(tmp); free(d_attn);
+        free(d_rm2); free(tmp); free(d_attn); free(d_cat);
     }
     free(d_logits); free(d_final); free(d_cur);
 }
@@ -903,8 +948,9 @@ static void train_hybrid(DualModel *dm, const char *path, int max_steps, float l
 
     printf("[janus-hybrid] corpus: %ld bytes → %d BPE tokens\n", fsz, bpe_len);
     printf("[janus-hybrid] model A: %d params (%.2fMB)\n", dm->A.n_params, dm->A.n_params*4.0f/1e6f);
+    int accum_steps = 32;
     printf("[janus-hybrid] optimizer: Chuck v4\n");
-    printf("[janus-hybrid] training: %d steps, lr=%.1e\n", max_steps, lr);
+    printf("[janus-hybrid] training: %d steps, lr=%.1e, accum=%d windows/step\n", max_steps, lr, accum_steps);
     printf("[janus-hybrid] PRESSURE: BPE training → char-level output\n");
 
     float best = 1e9f;
@@ -912,23 +958,37 @@ static void train_hybrid(DualModel *dm, const char *path, int max_steps, float l
 
     for (int step = 1; step <= max_steps; step++) {
         Model *active = (step%2==0) ? &dm->B : &dm->A;
-        int off = rand() % (bpe_len - T - 1);
-        for (int t = 0; t < T; t++) {
-            tokens[t] = bpe_data[off+t];
-            targets[t] = bpe_data[off+t+1];
-            if (tokens[t] >= BPE_VOCAB) tokens[t] = tokens[t] % BPE_VOCAB;
-            if (targets[t] >= BPE_VOCAB) targets[t] = targets[t] % BPE_VOCAB;
+        float step_loss = 0;
+
+        /* Zero gradients before accumulation */
+        memset(active->grad, 0, active->n_params * sizeof(float));
+
+        for (int micro = 0; micro < accum_steps; micro++) {
+            int off = rand() % (bpe_len - T - 1);
+            for (int t = 0; t < T; t++) {
+                tokens[t] = bpe_data[off+t];
+                targets[t] = bpe_data[off+t+1];
+                if (tokens[t] >= BPE_VOCAB) tokens[t] = tokens[t] % BPE_VOCAB;
+                if (targets[t] >= BPE_VOCAB) targets[t] = targets[t] % BPE_VOCAB;
+            }
+            float loss = forward_pass(&active->w, &a, tokens, targets, T, BPE_VOCAB, active->w.out_bpe);
+            backward_pass(&active->w, &active->g, &a, tokens, targets, T, BPE_VOCAB,
+                          active->w.out_bpe, active->g.out_bpe);
+            step_loss += loss;
         }
-        float loss = forward_pass(&active->w, &a, tokens, targets, T, BPE_VOCAB, active->w.out_bpe);
-        backward_pass(&active->w, &active->g, &a, tokens, targets, T, BPE_VOCAB,
-                      active->w.out_bpe, active->g.out_bpe);
-        chuck_observe(loss);
+
+        /* Average gradients over micro-batches */
+        float inv_accum = 1.0f / accum_steps;
+        for (int i = 0; i < active->n_params; i++) active->grad[i] *= inv_accum;
+        step_loss *= inv_accum;
+
+        chuck_observe(step_loss);
         chuck_update(active->data, active->grad, active->chuck_m, active->chuck_v, active->n_params, lr);
-        if (loss < best) best = loss;
+        if (step_loss < best) best = step_loss;
         if (step % 100 == 0 || step == 1) {
             float elapsed = (float)(clock()-t0)/CLOCKS_PER_SEC;
             printf("  step %5d/%d  loss=%.4f  best=%.4f  chuck=[λ=%.3f]  %.1f s/s\n",
-                   step, max_steps, loss, best, Chuck.dampen, step/(elapsed+1e-6f));
+                   step, max_steps, step_loss, best, Chuck.dampen, step/(elapsed+1e-6f));
         }
     }
     printf("[janus-hybrid] training complete. best loss: %.4f\n", best);

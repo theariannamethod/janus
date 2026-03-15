@@ -212,6 +212,16 @@ static void matmul_atb(float *C, const float *A, const float *B, int m, int k, i
         }
 }
 
+/* Accumulating version: C += A^T @ B (for gradient accumulation) */
+static void matmul_atb_acc(float *C, const float *A, const float *B, int m, int k, int n) {
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) {
+            float s = 0;
+            for (int p = 0; p < k; p++) s += A[p*m+i] * B[p*n+j];
+            C[i*n+j] += s;
+        }
+}
+
 static void matmul_abt(float *C, const float *A, const float *B, int m, int k, int n) {
     for (int i = 0; i < m; i++)
         for (int j = 0; j < n; j++) {
@@ -584,7 +594,7 @@ static void backward(Ptrs *w, Ptrs *g, Acts *a, int *tok, int *tgt, int T) {
         for (int v = 0; v < VOCAB; v++) dl[t*VOCAB+v] /= T;
     }
 
-    matmul_atb(g->out_w, a->frm, dl, DIM, T, VOCAB);
+    matmul_atb_acc(g->out_w, a->frm, dl, DIM, T, VOCAB);
     matmul_abt(df, dl, w->out_w, T, VOCAB, DIM);
 
     float *cur = (BLOCKS > 0) ? a->r2 : a->x;
@@ -597,7 +607,7 @@ static void backward(Ptrs *w, Ptrs *g, Acts *a, int *tok, int *tgt, int T) {
 
     for (int b = BLOCKS-1; b >= 0; b--) {
         float *dm = calloc(T*DIM, 4); memcpy(dm, dc, T*DIM*4);
-        matmul_atb(g->w_down[b], a->ms, dm, MLP_DIM, T, DIM);
+        matmul_atb_acc(g->w_down[b], a->ms, dm, MLP_DIM, T, DIM);
         float *ds = calloc(T*MLP_DIM, 4);
         matmul_abt(ds, dm, w->w_down[b], T, DIM, MLP_DIM);
         float *dg2 = calloc(T*MLP_DIM, 4), *du = calloc(T*MLP_DIM, 4);
@@ -605,8 +615,8 @@ static void backward(Ptrs *w, Ptrs *g, Acts *a, int *tok, int *tgt, int T) {
             du[i] = ds[i] * siluf(a->mg[i]);
             dg2[i] = ds[i] * a->mu[i] * siluf_grad(a->mg[i]);
         }
-        matmul_atb(g->w_gate[b], a->rm2, dg2, DIM, T, MLP_DIM);
-        matmul_atb(g->w_up[b], a->rm2, du, DIM, T, MLP_DIM);
+        matmul_atb_acc(g->w_gate[b], a->rm2, dg2, DIM, T, MLP_DIM);
+        matmul_atb_acc(g->w_up[b], a->rm2, du, DIM, T, MLP_DIM);
         float *dr = calloc(T*DIM, 4), *tmp = calloc(T*DIM, 4);
         matmul_abt(dr, dg2, w->w_gate[b], T, MLP_DIM, DIM);
         matmul_abt(tmp, du, w->w_up[b], T, MLP_DIM, DIM);
@@ -617,11 +627,43 @@ static void backward(Ptrs *w, Ptrs *g, Acts *a, int *tok, int *tgt, int T) {
             float inv = 1.0f / sqrtf(ss/DIM + 1e-5f);
             for (int e = 0; e < DIM; e++) dc[t*DIM+e] += dr[t*DIM+e]*w->rms2[b][e]*inv;
         }
-        /* Attention backward: push gradients to wo and wj_v */
+        /* Attention backward: da = gradient w.r.t. attn_out */
         float *da = calloc(T*DIM, 4); memcpy(da, dc, T*DIM*4);
-        matmul_atb(g->wo[b], a->v_out, da, DIM, T, DIM);  /* approximate */
-        /* wj_v gradient from attn·v */
-        matmul_atb(g->wj_v[b], a->rm1, da, DIM, T, DIM);
+
+        /* out = ctx @ wo, where ctx = attn @ v_out
+         * Recompute ctx for correct wo gradient */
+        float *ctx_recomp = calloc(T*DIM, 4);
+        matmul(ctx_recomp, a->j_attn, a->v_out, T, T, DIM);
+        matmul_atb_acc(g->wo[b], ctx_recomp, da, DIM, T, DIM);
+
+        /* d_ctx = da @ wo^T */
+        float *d_ctx = calloc(T*DIM, 4);
+        matmul_abt(d_ctx, da, w->wo[b], T, DIM, DIM);
+
+        /* d_v_out = attn^T @ d_ctx */
+        float *d_vout = calloc(T*DIM, 4);
+        matmul_atb(d_vout, a->j_attn, d_ctx, T, T, DIM);
+
+        /* wj_v gradient: v_out = rm1 @ wj_v, so g_wj_v = rm1^T @ d_vout */
+        matmul_atb_acc(g->wj_v[b], a->rm1, d_vout, DIM, T, DIM);
+
+        /* d_rm1 from value path: d_rm1 = d_vout @ wj_v^T */
+        float *d_rm1 = calloc(T*DIM, 4);
+        matmul_abt(d_rm1, d_vout, w->wj_v[b], T, DIM, DIM);
+
+        /* RMSNorm1 backward: propagate d_rm1 through rmsnorm to dc */
+        {
+            float *inp = (b == 0) ? a->x : a->r2;  /* input to rmsnorm1 = cur */
+            for (int t = 0; t < T; t++) {
+                float ss = 0;
+                for (int e = 0; e < DIM; e++) ss += inp[t*DIM+e]*inp[t*DIM+e];
+                float inv = 1.0f / sqrtf(ss/DIM + 1e-5f);
+                for (int e = 0; e < DIM; e++)
+                    dc[t*DIM+e] += d_rm1[t*DIM+e] * w->rms1[b][e] * inv;
+            }
+        }
+
+        free(ctx_recomp); free(d_ctx); free(d_vout); free(d_rm1);
 
         if (b == 0) {
             for (int t = 0; t < T; t++)
@@ -782,20 +824,30 @@ static void train_model(DualModel *dm, const char *path, int max_steps, float lr
     printf("[metajanus] Janus-attention-only model: %d params × 2\n", dm->A.n_params);
     printf("[metajanus] Chuck optimizer, %d steps, lr=%.1e\n", max_steps, lr);
 
+    int accum_steps = 32;
     float best = 1e9f; clock_t t0 = clock();
     for (int step = 1; step <= max_steps; step++) {
         Model *act = (step % 2) ? &dm->A : &dm->B;
-        int off = rand() % (fsz - T - 1);
-        for (int t = 0; t < T; t++) { tok[t] = data[off+t]; tgt[t] = data[off+t+1]; }
-        float loss = forward(&act->w, &a, tok, tgt, T);
-        backward(&act->w, &act->g, &a, tok, tgt, T);
-        chuck_observe(loss);
+        /* Zero gradients before accumulation */
+        memset(act->grad, 0, act->n_params * sizeof(float));
+        float accum_loss = 0;
+        for (int w = 0; w < accum_steps; w++) {
+            int off = rand() % (fsz - T - 1);
+            for (int t = 0; t < T; t++) { tok[t] = data[off+t]; tgt[t] = data[off+t+1]; }
+            float loss = forward(&act->w, &a, tok, tgt, T);
+            backward(&act->w, &act->g, &a, tok, tgt, T);
+            accum_loss += loss;
+        }
+        accum_loss /= accum_steps;
+        /* Scale gradients by 1/accum_steps */
+        for (int i = 0; i < act->n_params; i++) act->grad[i] /= accum_steps;
+        chuck_observe(accum_loss);
         chuck_update(act->data, act->grad, act->cm, act->cv, act->n_params, lr);
-        if (loss < best) best = loss;
+        if (accum_loss < best) best = accum_loss;
         if (step % 100 == 0 || step == 1) {
             float el = (float)(clock()-t0)/CLOCKS_PER_SEC;
-            printf("  step %5d/%d  loss=%.4f  best=%.4f  chuck=[λ=%.3f]  %.1f s/s\n",
-                   step, max_steps, loss, best, Chuck.dampen, step/(el+1e-6f));
+            printf("  step %5d/%d  loss=%.4f  best=%.4f  chuck=[λ=%.3f]  %.1f s/s  (batch=%d)\n",
+                   step, max_steps, accum_loss, best, Chuck.dampen, step/(el+1e-6f), accum_steps);
         }
     }
     printf("[metajanus] done. best=%.4f\n", best);

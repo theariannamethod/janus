@@ -939,15 +939,38 @@ static void backward(Ptrs *w, Ptrs *g, Acts *a, int *tokens, int *targets, int T
                 }
         }
 
-        /* RMSNorm1 backward (approx) */
+        /* Compute d_rm1: gradient w.r.t. RMSNorm1 output from attention path */
+        float *d_rm1 = (float *)calloc(T * E, sizeof(float));
+        for (int h = 0; h < H; h++) {
+            float gate_logits2[3] = { w->gate[b][h*3+0],
+                                      w->gate[b][h*3+1],
+                                      w->gate[b][h*3+2] };
+            row_softmax(gate_logits2, 3);
+            float ga2 = gate_logits2[0], gb2 = gate_logits2[1];
+            for (int t = 0; t < T; t++)
+                for (int d = 0; d < D; d++) {
+                    float dc = d_cat[t*E + h*D + d];
+                    for (int e = 0; e < E; e++) {
+                        d_rm1[t*E+e] += dc * ga2 * w->wv[b][h*E*D + e*D + d] / T;
+                        d_rm1[t*E+e] += dc * gb2 * w->wvr[b][h*E*D + e*D + d] / T;
+                    }
+                }
+        }
+
+        /* RMSNorm1 backward (approx): propagate d_rm1 through norm to input */
         float *input = (b == 0) ? a->x : a->r2;
         for (int t = 0; t < T; t++) {
             float ss = 0;
             for (int e = 0; e < E; e++) ss += input[t*E+e] * input[t*E+e];
             float inv = 1.0f / sqrtf(ss / E + 1e-5f);
-            for (int e = 0; e < E; e++)
-                g->rms1[b][e] += d_cur[t*E+e] * input[t*E+e] * inv;
+            for (int e = 0; e < E; e++) {
+                /* Gain gradient from attention path */
+                g->rms1[b][e] += d_rm1[t*E+e] * input[t*E+e] * inv;
+                /* Input gradient: propagate through RMSNorm1 back to block input */
+                d_cur[t*E+e] += d_rm1[t*E+e] * w->rms1[b][e] * inv;
+            }
         }
+        free(d_rm1);
 
         /* Embedding gradient */
         if (b == 0) {
@@ -1276,23 +1299,33 @@ static void train(DualModel *dm, const char *path, int max_steps, float lr) {
     printf("[janus] model B: %d params (%.2fMB)\n",
            dm->B.n_params, dm->B.n_params * 4.0f / 1e6f);
     printf("[janus] optimizer: Chuck v4 (b1=%.1f b2=%.3f)\n", CHUCK_B1, CHUCK_B2);
-    printf("[janus] training: %d steps, lr=%.1e\n", max_steps, lr);
+    printf("[janus] training: %d steps, lr=%.1e, accum=%d\n", max_steps, lr, 32);
 
     float best_loss = 1e9f;
     clock_t t0 = clock();
+
+    int accum_steps = 32;
 
     for (int step = 1; step <= max_steps; step++) {
         /* Alternate training between matrix A and B */
         Model *active = (step % 2 == 0) ? &dm->B : &dm->A;
 
-        int offset = rand() % (fsz - T - 1);
-        for (int t = 0; t < T; t++) {
-            tokens[t]  = data[offset + t];
-            targets[t] = data[offset + t + 1];
-        }
+        float loss = 0;
+        for (int acc = 0; acc < accum_steps; acc++) {
+            int offset = rand() % (fsz - T - 1);
+            for (int t = 0; t < T; t++) {
+                tokens[t]  = data[offset + t];
+                targets[t] = data[offset + t + 1];
+            }
 
-        float loss = forward(&active->w, &a, tokens, targets, T);
-        backward(&active->w, &active->g, &a, tokens, targets, T);
+            loss += forward(&active->w, &a, tokens, targets, T);
+            backward(&active->w, &active->g, &a, tokens, targets, T);
+        }
+        loss /= accum_steps;
+
+        /* Divide accumulated gradients by accum_steps */
+        for (int i = 0; i < active->n_params; i++)
+            active->grad[i] /= accum_steps;
 
         /* Chuck optimizer */
         chuck_observe(loss);
