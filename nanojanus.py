@@ -936,26 +936,67 @@ def display_metrics():
 # TRAINING -- BPE input -> word prediction with RRPRAM forward + Chuck
 # ===================================================================
 
+def dsilu(x):
+    """Derivative of SiLU: silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))."""
+    if x < -20:
+        return 0.0
+    sig = 1.0 / (1.0 + math.exp(-x))
+    return sig * (1.0 + x * (1.0 - sig))
+
+
+GRAD_ACCUM_WINDOWS = 32  # accumulate gradients across this many windows
+
+
+def _zero_grad_like_flat(size):
+    return [0.0] * size
+
+
+def _zero_grad_like_nested(template):
+    """Zero-fill gradient accumulator matching a nested list-of-lists structure."""
+    return [[0.0] * len(sub) for sub in template]
+
+
 def train_on_text(text, total_steps=2000, lr=0.001):
-    """Training loop: BPE input embeddings, word output embeddings,
-    RRPRAM per-step weights. Chuck optimizer (macro patience, lambda
-    modulation, stagnation noise)."""
+    """Training loop with proper backward through full RRPRAM chain.
+
+    Fixes vs original:
+      1. Full backward: d_logits -> d_out -> d_hidden (through W_down) ->
+         d_swiglu -> d_gate/d_up (SwiGLU backward) -> d_qn (through W_gate^T,
+         W_up^T + residual) -> d_query (RMSNorm backward) -> d_ctx (through
+         Wr^T) -> d_embed_in.  ALL weights updated: embed_out, embed_in, Wr,
+         rms, gate, up, down.
+      2. Gradient accumulation: gradients accumulated across all 12 sub-steps
+         of a window AND across GRAD_ACCUM_WINDOWS windows before one weight
+         update.
+      3. Vocab coverage: unknown words kept in context with word_id=-1, skipped
+         as targets (same fix as penelope.c).
+    """
     global embed_in_A, embed_in_B, embed_out_A, embed_out_B
 
-    # Split text into words, find those in vocabulary
+    # BUG 3 FIX: keep unknown words in BPE context (word_id=-1), skip as
+    # targets.  This preserves positional context from unknown words.
     raw_words = re.sub(r'[^a-z\s]', '', text.lower()).split()
-    word_ids = []
+    word_entries = []  # list of {'word': str, 'word_id': int, 'bpe': list}
+    n_known = 0
     for w in raw_words:
         if w in WORDS:
-            word_ids.append(WORDS.index(w))
+            wid = WORDS.index(w)
+            word_entries.append({'word': w, 'word_id': wid, 'bpe': vocab_bpe[wid]})
+            n_known += 1
+        else:
+            # Unknown word: keep in BPE context, mark as non-target
+            bpe_ids = bpe_encode(w)
+            word_entries.append({'word': w, 'word_id': -1, 'bpe': bpe_ids})
 
-    if len(word_ids) < STEPS + 2:
+    if n_known < STEPS + 2:
         print(f'Error: too few vocabulary words found in text '
-              f'({len(word_ids)} words, need at least {STEPS + 2})')
+              f'({n_known} known words out of {len(word_entries)} total, '
+              f'need at least {STEPS + 2} known)')
         return
 
-    print(f'Tokenized: {len(word_ids)} vocab words found')
-    print(f'Training for {total_steps} steps ...')
+    print(f'Tokenized: {len(word_entries)} words ({n_known} known, '
+          f'{len(word_entries) - n_known} unknown kept as BPE context)')
+    print(f'Training for {total_steps} steps, grad accum over {GRAD_ACCUM_WINDOWS} windows ...')
 
     # Chuck optimizer state
     best_loss = float('inf')
@@ -964,140 +1005,323 @@ def train_on_text(text, total_steps=2000, lr=0.001):
     chuck_lambda = 1.0
 
     for step in range(total_steps):
-        offset = random.randint(0, len(word_ids) - STEPS - 2)
-        loss = 0.0
-        a = get_blend_alpha()
+        # Initialize gradient accumulators for ALL weight matrices
+        g_embed_out_A = _zero_grad_like_flat(NWORDS * DIM)
+        g_embed_in_A = _zero_grad_like_flat(BPE_VOCAB * DIM)
+        g_step_wr_a = _zero_grad_like_nested(step_wr_a)
+        g_step_rms_a = _zero_grad_like_nested(step_rms_a)
+        g_step_gate_a = _zero_grad_like_nested(step_gate_a)
+        g_step_up_a = _zero_grad_like_nested(step_up_a)
+        g_step_down_a = _zero_grad_like_nested(step_down_a)
 
-        for si in range(STEPS):
-            # Build BPE context from preceding words
-            bpe_ctx = []
-            for k in range(offset, offset + si + 1):
-                wb = vocab_bpe[word_ids[k]]
-                if wb:
-                    bpe_ctx.extend(wb)
-            target = word_ids[offset + si + 1]
+        total_loss = 0.0
+        n_targets = 0
 
-            # Pool embed_in_A
-            ctx = [0.0] * DIM
-            n = len(bpe_ctx) if bpe_ctx else 1
-            for tok_id in bpe_ctx:
-                if tok_id >= BPE_VOCAB:
+        for _window in range(GRAD_ACCUM_WINDOWS):
+            # Pick a random window of STEPS+1 words that has at least one
+            # known target (word_id != -1 at positions 1..STEPS)
+            max_offset = len(word_entries) - STEPS - 2
+            if max_offset < 0:
+                break
+            offset = random.randint(0, max_offset)
+
+            for si in range(STEPS):
+                target_entry = word_entries[offset + si + 1]
+                target = target_entry['word_id']
+
+                # BUG 3: skip unknown words as targets, but they still
+                # contribute BPE context below
+                if target < 0:
                     continue
-                base = tok_id * DIM
-                for d in range(DIM):
-                    ctx[d] += embed_in_A[base + d]
-            inv = 1.0 / n
-            for d in range(DIM):
-                ctx[d] *= inv
 
-            # RRPRAM: query = ctx @ Wr
-            query = [0.0] * DIM
-            for i in range(DIM):
-                acc = 0.0
-                for j in range(DIM):
-                    acc += step_wr_a[si][i * DIM + j] * ctx[j]
-                query[i] = acc
+                # Build BPE context from preceding words (including unknowns)
+                bpe_ctx = []
+                for k in range(offset, offset + si + 1):
+                    wb = word_entries[k]['bpe']
+                    if wb:
+                        bpe_ctx.extend(wb)
 
-            # RMSNorm
-            ss = sum(q * q for q in query)
-            rms_inv = 1.0 / math.sqrt(ss / DIM + 1e-5)
-            qn = [step_rms_a[si][i] * query[i] * rms_inv for i in range(DIM)]
-
-            # SwiGLU forward
-            gate = [0.0] * HDIM
-            up = [0.0] * HDIM
-            for i in range(HDIM):
-                sg = 0.0
-                su = 0.0
-                for j in range(DIM):
-                    sg += step_gate_a[si][i * DIM + j] * qn[j]
-                    su += step_up_a[si][i * DIM + j] * qn[j]
-                gate[i] = sg
-                up[i] = su
-            swiglu = [silu(gate[i]) * up[i] for i in range(HDIM)]
-
-            hidden = [0.0] * DIM
-            for i in range(DIM):
-                acc = 0.0
-                for j in range(HDIM):
-                    acc += step_down_a[si][i * HDIM + j] * swiglu[j]
-                hidden[i] = acc
-
-            out = [qn[i] + hidden[i] for i in range(DIM)]
-
-            # Logits = embed_out_A @ out
-            logits = [0.0] * NWORDS
-            for v in range(NWORDS):
-                acc = 0.0
-                vbase = v * DIM
-                for d in range(DIM):
-                    acc += embed_out_A[vbase + d] * out[d]
-                logits[v] = acc
-
-            # Softmax + cross-entropy loss
-            mx = max(logits)
-            exp_logits = [math.exp(l - mx) for l in logits]
-            total = sum(exp_logits)
-            probs = [e / total for e in exp_logits]
-
-            p = max(1e-10, probs[target])
-            loss -= math.log(p)
-
-            # Gradient: d_logits = probs - one_hot
-            d_logits = list(probs)
-            d_logits[target] -= 1.0
-
-            chuck_mod = chuck_lambda
-
-            # Update embed_out_A
-            for v in range(NWORDS):
-                if abs(d_logits[v]) < 1e-6:
+                if not bpe_ctx:
                     continue
-                vbase = v * DIM
-                for d in range(DIM):
-                    embed_out_A[vbase + d] -= lr * chuck_mod * d_logits[v] * out[d]
 
-            # Update embed_in_A (gradient through pool_context)
-            for tok_id in bpe_ctx:
-                if tok_id >= BPE_VOCAB:
-                    continue
-                base = tok_id * DIM
-                for d in range(DIM):
-                    embed_in_A[base + d] -= lr * chuck_mod * 0.01 * qn[d] / n
+                # ============================================================
+                # FORWARD PASS (using A matrices only, same as before)
+                # ============================================================
 
-            # Update Wr
-            for i in range(DIM):
-                for j in range(DIM):
-                    step_wr_a[si][i * DIM + j] -= lr * chuck_mod * 0.01 * qn[i] * ctx[j]
-
-        # Train matrix B on even steps (simpler: next-word embedding similarity)
-        if step % 2 == 0:
-            off2 = random.randint(0, len(word_ids) - 2)
-            src_word = word_ids[off2]
-            tgt_word = word_ids[off2 + 1]
-            src_bpe = vocab_bpe[src_word]
-            if src_bpe and len(src_bpe) > 0:
-                ctx2 = [0.0] * DIM
-                for tok_id in src_bpe:
+                # 1. Pool embed_in_A
+                ctx = [0.0] * DIM
+                n = len(bpe_ctx)
+                for tok_id in bpe_ctx:
                     if tok_id >= BPE_VOCAB:
                         continue
                     base = tok_id * DIM
                     for d in range(DIM):
-                        ctx2[d] += embed_in_B[base + d]
-                inv2 = 1.0 / len(src_bpe)
+                        ctx[d] += embed_in_A[base + d]
+                inv = 1.0 / n
                 for d in range(DIM):
-                    ctx2[d] *= inv2
+                    ctx[d] *= inv
+
+                # 2. query = Wr @ ctx
+                query = [0.0] * DIM
+                for i in range(DIM):
+                    acc = 0.0
+                    for j in range(DIM):
+                        acc += step_wr_a[si][i * DIM + j] * ctx[j]
+                    query[i] = acc
+
+                # 3. RMSNorm: qn = rms_weight * query * rms_inv
+                ss = sum(q * q for q in query)
+                rms_inv = 1.0 / math.sqrt(ss / DIM + 1e-5)
+                qn = [step_rms_a[si][i] * query[i] * rms_inv for i in range(DIM)]
+
+                # 4. SwiGLU: gate = W_gate @ qn, up = W_up @ qn
+                gate = [0.0] * HDIM
+                up = [0.0] * HDIM
+                for i in range(HDIM):
+                    sg = 0.0
+                    su = 0.0
+                    for j in range(DIM):
+                        sg += step_gate_a[si][i * DIM + j] * qn[j]
+                        su += step_up_a[si][i * DIM + j] * qn[j]
+                    gate[i] = sg
+                    up[i] = su
+
+                # silu_gate[i] = silu(gate[i])
+                silu_gate = [silu(gate[i]) for i in range(HDIM)]
+                swiglu = [silu_gate[i] * up[i] for i in range(HDIM)]
+
+                # 5. hidden = W_down @ swiglu
+                hidden = [0.0] * DIM
+                for i in range(DIM):
+                    acc = 0.0
+                    for j in range(HDIM):
+                        acc += step_down_a[si][i * HDIM + j] * swiglu[j]
+                    hidden[i] = acc
+
+                # 6. out = qn + hidden (residual)
+                out = [qn[i] + hidden[i] for i in range(DIM)]
+
+                # 7. logits = embed_out_A @ out
+                logits = [0.0] * NWORDS
                 for v in range(NWORDS):
-                    sc = 0.0
+                    acc = 0.0
                     vbase = v * DIM
                     for d in range(DIM):
-                        sc += embed_out_B[vbase + d] * ctx2[d]
-                    grad = (-1.0 if v == tgt_word else 0.0) + 0.001
+                        acc += embed_out_A[vbase + d] * out[d]
+                    logits[v] = acc
+
+                # 8. Softmax + cross-entropy
+                mx = max(logits)
+                exp_logits = [math.exp(l - mx) for l in logits]
+                sm_total = sum(exp_logits)
+                probs = [e / sm_total for e in exp_logits]
+
+                p = max(1e-10, probs[target])
+                total_loss -= math.log(p)
+                n_targets += 1
+
+                # ============================================================
+                # BACKWARD PASS -- proper gradient chain through everything
+                # ============================================================
+
+                # d_logits = probs - one_hot(target)
+                d_logits = list(probs)
+                d_logits[target] -= 1.0
+
+                # --- d_logits -> d_embed_out_A, d_out ---
+                # logits[v] = sum_d(embed_out_A[v,d] * out[d])
+                # d_embed_out_A[v,d] += d_logits[v] * out[d]
+                # d_out[d] += sum_v(d_logits[v] * embed_out_A[v,d])
+                d_out = [0.0] * DIM
+                for v in range(NWORDS):
+                    dl = d_logits[v]
+                    if abs(dl) < 1e-8:
+                        continue
+                    vbase = v * DIM
                     for d in range(DIM):
-                        embed_out_B[vbase + d] -= lr * grad * ctx2[d] * 0.1
+                        g_embed_out_A[vbase + d] += dl * out[d]
+                        d_out[d] += dl * embed_out_A[vbase + d]
+
+                # --- d_out -> d_qn (residual), d_hidden ---
+                # out = qn + hidden => d_qn_res = d_out, d_hidden = d_out
+                d_hidden = list(d_out)
+                d_qn = list(d_out)  # residual path; more will be added below
+
+                # --- d_hidden -> d_step_down_a, d_swiglu ---
+                # hidden[i] = sum_j(W_down[i,j] * swiglu[j])
+                # d_W_down[i,j] += d_hidden[i] * swiglu[j]
+                # d_swiglu[j] += sum_i(d_hidden[i] * W_down[i,j])
+                d_swiglu = [0.0] * HDIM
+                for i in range(DIM):
+                    dh = d_hidden[i]
+                    if abs(dh) < 1e-10:
+                        continue
+                    for j in range(HDIM):
+                        g_step_down_a[si][i * HDIM + j] += dh * swiglu[j]
+                        d_swiglu[j] += dh * step_down_a[si][i * HDIM + j]
+
+                # --- d_swiglu -> d_gate, d_up ---
+                # swiglu[i] = silu(gate[i]) * up[i]
+                # d_gate[i] = d_swiglu[i] * up[i] * dsilu(gate[i])
+                # d_up[i] = d_swiglu[i] * silu(gate[i])
+                d_gate = [d_swiglu[i] * up[i] * dsilu(gate[i]) for i in range(HDIM)]
+                d_up = [d_swiglu[i] * silu_gate[i] for i in range(HDIM)]
+
+                # --- d_gate -> d_step_gate_a, d_qn (from gate path) ---
+                # gate[i] = sum_j(W_gate[i,j] * qn[j])
+                # d_W_gate[i,j] += d_gate[i] * qn[j]
+                # d_qn[j] += sum_i(d_gate[i] * W_gate[i,j])
+                for i in range(HDIM):
+                    dg = d_gate[i]
+                    if abs(dg) < 1e-10:
+                        continue
+                    for j in range(DIM):
+                        g_step_gate_a[si][i * DIM + j] += dg * qn[j]
+                        d_qn[j] += dg * step_gate_a[si][i * DIM + j]
+
+                # --- d_up -> d_step_up_a, d_qn (from up path) ---
+                # up[i] = sum_j(W_up[i,j] * qn[j])
+                for i in range(HDIM):
+                    du = d_up[i]
+                    if abs(du) < 1e-10:
+                        continue
+                    for j in range(DIM):
+                        g_step_up_a[si][i * DIM + j] += du * qn[j]
+                        d_qn[j] += du * step_up_a[si][i * DIM + j]
+
+                # --- d_qn -> d_step_rms_a, d_query (RMSNorm backward) ---
+                # qn[i] = rms_w[i] * query[i] * rms_inv
+                # where rms_inv = 1/sqrt(ss/DIM + eps), ss = sum(query^2)
+                #
+                # d_rms_w[i] += d_qn[i] * query[i] * rms_inv
+                #
+                # For d_query, need to account for rms_inv depending on query:
+                # Let normalized[i] = query[i] * rms_inv
+                # qn[i] = rms_w[i] * normalized[i]
+                # d_normalized[i] = d_qn[i] * rms_w[i]
+                #
+                # RMSNorm backward for normalized = query * rms_inv:
+                # d_query[i] = rms_inv * (d_normalized[i] - normalized[i] *
+                #              (sum_j(d_normalized[j] * normalized[j])) / DIM)
+                d_normalized = [d_qn[i] * step_rms_a[si][i] for i in range(DIM)]
+                normalized = [query[i] * rms_inv for i in range(DIM)]
+
+                # d_rms_w
+                for i in range(DIM):
+                    g_step_rms_a[si][i] += d_qn[i] * normalized[i]
+
+                # dot product for RMSNorm backward
+                dn_dot_n = sum(d_normalized[i] * normalized[i] for i in range(DIM))
+                d_query = [rms_inv * (d_normalized[i] - normalized[i] * dn_dot_n / DIM)
+                           for i in range(DIM)]
+
+                # --- d_query -> d_step_wr_a, d_ctx ---
+                # query[i] = sum_j(Wr[i,j] * ctx[j])
+                # d_Wr[i,j] += d_query[i] * ctx[j]
+                # d_ctx[j] += sum_i(d_query[i] * Wr[i,j])
+                d_ctx = [0.0] * DIM
+                for i in range(DIM):
+                    dq = d_query[i]
+                    if abs(dq) < 1e-10:
+                        continue
+                    for j in range(DIM):
+                        g_step_wr_a[si][i * DIM + j] += dq * ctx[j]
+                        d_ctx[j] += dq * step_wr_a[si][i * DIM + j]
+
+                # --- d_ctx -> d_embed_in_A ---
+                # ctx[d] = (1/n) * sum_tok(embed_in_A[tok, d])
+                # d_embed_in_A[tok, d] += d_ctx[d] / n
+                for tok_id in bpe_ctx:
+                    if tok_id >= BPE_VOCAB:
+                        continue
+                    base = tok_id * DIM
+                    for d in range(DIM):
+                        g_embed_in_A[base + d] += d_ctx[d] * inv
+
+        # ================================================================
+        # APPLY ACCUMULATED GRADIENTS
+        # ================================================================
+        if n_targets == 0:
+            continue
+
+        scale = lr * chuck_lambda / n_targets
+
+        # Gradient clipping: compute global grad norm, clip to max_norm=1.0
+        grad_sq = 0.0
+        for i in range(len(g_embed_out_A)):
+            grad_sq += g_embed_out_A[i] * g_embed_out_A[i]
+        for i in range(len(g_embed_in_A)):
+            grad_sq += g_embed_in_A[i] * g_embed_in_A[i]
+        for si in range(STEPS):
+            for i in range(len(g_step_wr_a[si])):
+                grad_sq += g_step_wr_a[si][i] * g_step_wr_a[si][i]
+            for i in range(len(g_step_rms_a[si])):
+                grad_sq += g_step_rms_a[si][i] * g_step_rms_a[si][i]
+            for i in range(len(g_step_gate_a[si])):
+                grad_sq += g_step_gate_a[si][i] * g_step_gate_a[si][i]
+            for i in range(len(g_step_up_a[si])):
+                grad_sq += g_step_up_a[si][i] * g_step_up_a[si][i]
+            for i in range(len(g_step_down_a[si])):
+                grad_sq += g_step_down_a[si][i] * g_step_down_a[si][i]
+        grad_norm = math.sqrt(grad_sq + 1e-10)
+        max_norm = 1.0
+        if grad_norm > max_norm:
+            scale *= max_norm / grad_norm
+
+        # Apply to embed_out_A
+        for i in range(len(g_embed_out_A)):
+            embed_out_A[i] -= scale * g_embed_out_A[i]
+
+        # Apply to embed_in_A
+        for i in range(len(g_embed_in_A)):
+            embed_in_A[i] -= scale * g_embed_in_A[i]
+
+        # Apply to per-step weights
+        for si in range(STEPS):
+            for i in range(len(g_step_wr_a[si])):
+                step_wr_a[si][i] -= scale * g_step_wr_a[si][i]
+            for i in range(len(g_step_rms_a[si])):
+                step_rms_a[si][i] -= scale * g_step_rms_a[si][i]
+            for i in range(len(g_step_gate_a[si])):
+                step_gate_a[si][i] -= scale * g_step_gate_a[si][i]
+            for i in range(len(g_step_up_a[si])):
+                step_up_a[si][i] -= scale * g_step_up_a[si][i]
+            for i in range(len(g_step_down_a[si])):
+                step_down_a[si][i] -= scale * g_step_down_a[si][i]
+
+        # Train matrix B on even steps (simpler: next-word embedding similarity)
+        if step % 2 == 0:
+            # Pick a random known-word pair for B matrix training
+            known_indices = [i for i in range(len(word_entries) - 1)
+                            if word_entries[i]['word_id'] >= 0
+                            and word_entries[i + 1]['word_id'] >= 0]
+            if known_indices:
+                off2 = random.choice(known_indices)
+                src_word = word_entries[off2]['word_id']
+                tgt_word = word_entries[off2 + 1]['word_id']
+                src_bpe = vocab_bpe[src_word]
+                if src_bpe and len(src_bpe) > 0:
+                    ctx2 = [0.0] * DIM
+                    for tok_id in src_bpe:
+                        if tok_id >= BPE_VOCAB:
+                            continue
+                        base = tok_id * DIM
+                        for d in range(DIM):
+                            ctx2[d] += embed_in_B[base + d]
+                    inv2 = 1.0 / len(src_bpe)
+                    for d in range(DIM):
+                        ctx2[d] *= inv2
+                    for v in range(NWORDS):
+                        sc = 0.0
+                        vbase = v * DIM
+                        for d in range(DIM):
+                            sc += embed_out_B[vbase + d] * ctx2[d]
+                        grad = (-1.0 if v == tgt_word else 0.0) + 0.001
+                        for d in range(DIM):
+                            embed_out_B[vbase + d] -= lr * grad * ctx2[d] * 0.1
 
         # Chuck optimizer: macro patience + stagnation noise
-        avg_loss = loss / STEPS
+        avg_loss = total_loss / n_targets if n_targets > 0 else float('inf')
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
@@ -1113,7 +1337,8 @@ def train_on_text(text, total_steps=2000, lr=0.001):
 
         if step % 100 == 0:
             print(f'  step {step:>5}/{total_steps}  loss={avg_loss:.4f}  '
-                  f'chuck_l={chuck_lambda:.3f}  best={best_loss:.4f}')
+                  f'chuck_l={chuck_lambda:.3f}  best={best_loss:.4f}  '
+                  f'targets={n_targets}  gnorm={grad_norm:.4f}')
 
     print(f'Training complete: {total_steps} steps, final best loss={best_loss:.4f}')
 
