@@ -1128,19 +1128,32 @@ def train_on_text(text, total_steps=2000, lr=0.001):
                 d_logits = list(probs)
                 d_logits[target] -= 1.0
 
-                # --- d_logits -> d_embed_out_A, d_out ---
-                # logits[v] = sum_d(embed_out_A[v,d] * out[d])
-                # d_embed_out_A[v,d] += d_logits[v] * out[d]
-                # d_out[d] += sum_v(d_logits[v] * embed_out_A[v,d])
+                # --- d_logits -> d_embed_in_A (through BPE word embeddings), d_out ---
+                # logits[v] = mean(embed_in[bpe_tok] · out) for word v's BPE tokens
+                # d_out[d] += sum_v(d_logits[v] * word_emb[v,d])
+                # d_embed_in[bpe_tok,d] += d_logits[v] * out[d] / bpe_len
                 d_out = [0.0] * DIM
                 for v in range(NWORDS):
                     dl = d_logits[v]
                     if abs(dl) < 1e-8:
                         continue
-                    vbase = v * DIM
+                    bpe_toks = vocab_bpe[v]
+                    bl = len(bpe_toks)
+                    if bl == 0:
+                        continue
+                    inv_bl = 1.0 / bl
+                    # compute word_emb[v] = mean(embed_in_A[tok]) for d_out
                     for d in range(DIM):
-                        g_embed_out_A[vbase + d] += dl * out[d]
-                        d_out[d] += dl * embed_out_A[vbase + d]
+                        wemb_d = 0.0
+                        for tok in bpe_toks:
+                            wemb_d += a * embed_in_A[tok * DIM + d] + b * embed_in_B[tok * DIM + d]
+                        wemb_d *= inv_bl
+                        d_out[d] += dl * wemb_d
+                    # gradient to embed_in_A through BPE tokens
+                    for tok in bpe_toks:
+                        base = tok * DIM
+                        for d in range(DIM):
+                            g_embed_in_A[base + d] += dl * out[d] * inv_bl
 
                 # --- d_out -> d_qn (residual), d_hidden ---
                 # out = qn + hidden => d_qn_res = d_out, d_hidden = d_out
