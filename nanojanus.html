@@ -343,6 +343,14 @@ const VOCAB_LENS = [];
 // Precomputed BPE encoding for each vocabulary word
 let vocabBpe = [];
 
+// Extended vocabulary: hardcoded words + whole-word BPE tokens
+// Each entry: {word: string, bpeIds: number[], fromHardcoded: boolean, origIdx: number}
+// origIdx = index in WORDS[] for hardcoded, -1 for BPE-derived
+let extVocab = [];
+
+// Weight loading state
+let hasWeights = false;
+
 // ═══ BPE TOKENIZER (real byte-pair encoding, from penelope.c) ═══
 
 function bpeEncode(text) {
@@ -375,6 +383,73 @@ function initVocabBpe() {
   vocabBpe = [];
   for (let i = 0; i < NWORDS; i++)
     vocabBpe.push(bpeEncode(WORDS[i]));
+}
+
+// ═══ BPE DECODE — build reverse mapping from token ID to string ═══
+// Base tokens 0..255 = single bytes. Each merge m creates token (256+m)
+// by concatenating the strings of its two operands.
+const bpeStrs = [];
+
+function buildBpeStrs() {
+  bpeStrs.length = 0;
+  // Base: each byte is its character
+  for (let i = 0; i < 256; i++)
+    bpeStrs.push(String.fromCharCode(i));
+  // Merges: token (256+m) = concat of left and right operand strings
+  for (let m = 0; m < BPE_MERGES; m++) {
+    const left = BPE_TABLE[m][0], right = BPE_TABLE[m][1];
+    bpeStrs.push((bpeStrs[left] || '') + (bpeStrs[right] || ''));
+  }
+}
+
+function bpeDecode(tokenId) {
+  if (bpeStrs.length === 0) buildBpeStrs();
+  if (tokenId >= 0 && tokenId < bpeStrs.length) return bpeStrs[tokenId];
+  return '';
+}
+
+// ═══ EXTENDED VOCAB — hardcoded words + whole-word BPE tokens ═══
+function buildExtendedVocab() {
+  extVocab = [];
+  const wordSet = new Set();
+
+  // 1. All hardcoded vocabulary words (with their precomputed BPE encodings)
+  for (let i = 0; i < NWORDS; i++) {
+    extVocab.push({
+      word: WORDS[i],
+      bpeIds: vocabBpe[i],
+      fromHardcoded: true,
+      origIdx: i
+    });
+    wordSet.add(WORDS[i].toLowerCase());
+  }
+
+  // 2. Scan every BPE token (0..BPE_VOCAB-1) for whole words
+  //    A "whole word" = only lowercase a-z, length >= 2
+  if (bpeStrs.length === 0) buildBpeStrs();
+  const wholeWordRe = /^[a-z]{2,}$/;
+  let bpeAdded = 0;
+
+  for (let t = 0; t < BPE_VOCAB; t++) {
+    const s = bpeStrs[t];
+    if (!s) continue;
+    const lower = s.toLowerCase();
+    if (!wholeWordRe.test(lower)) continue;
+    if (wordSet.has(lower)) continue;
+    // This BPE token decodes to a whole word not in hardcoded vocab
+    extVocab.push({
+      word: lower,
+      bpeIds: [t],  // single token encodes the whole word
+      fromHardcoded: false,
+      origIdx: -1
+    });
+    wordSet.add(lower);
+    bpeAdded++;
+  }
+
+  const hardcoded = NWORDS;
+  console.log('[nanojanus] extended vocab: ' + extVocab.length + ' words (' +
+    hardcoded + ' hardcoded + ' + bpeAdded + ' from BPE)');
 }
 
 // Word-level tokenizer (for finding "charged word" origin — nanojanus-specific)
@@ -564,6 +639,8 @@ async function loadVocabulary() {
   NWORDS = WORDS.length;
   initWeights();
   initVocabBpe();
+  buildBpeStrs();
+  buildExtendedVocab();
   updateMetrics();
   console.log('[nanojanus] ready: ' + NWORDS + ' words, BPE vocab ' + BPE_VOCAB + ', ' + BPE_MERGES + ' merges');
 }
@@ -672,9 +749,100 @@ function forwardStep(bpeIds, stepIdx) {
   return logits;
 }
 
+// ═══ FORWARD STEP (TRAINED) — same RRPRAM pipeline, but scores via embed_in over extVocab ═══
+// When weights are loaded from training, embed_out is limited to NWORDS.
+// forwardStepTrained scores every word in extVocab by averaging dot products
+// of (blended embed_in) with the hidden output, over each word's BPE tokens.
+// This lets the model produce any word whose BPE encoding maps to learned embeddings.
+
+function forwardStepTrained(bpeIds, stepIdx) {
+  const s = stepIdx % STEPS;
+  const a = getBlendAlpha(), b = 1 - a;
+
+  // Pool context: average blended embed_in over all BPE tokens (identical to forwardStep)
+  const ctx = new Float32Array(DIM);
+  const n = bpeIds.length || 1;
+  for (const id of bpeIds) {
+    if (id >= BPE_VOCAB) continue;
+    for (let d = 0; d < DIM; d++)
+      ctx[d] += a * embed_in_A[id*DIM+d] + b * embed_in_B[id*DIM+d];
+  }
+  for (let d = 0; d < DIM; d++) ctx[d] /= n;
+
+  // RRPRAM: query = ctx @ Wr (blended)
+  const query = new Float32Array(DIM);
+  for (let i = 0; i < DIM; i++) {
+    let sum = 0;
+    for (let j = 0; j < DIM; j++)
+      sum += (a*stepWrA[s][i*DIM+j] + b*stepWrB[s][i*DIM+j]) * ctx[j];
+    query[i] = sum;
+  }
+
+  // RMSNorm
+  let ss = 0;
+  for (let i = 0; i < DIM; i++) ss += query[i]*query[i];
+  const rmsInv = 1 / Math.sqrt(ss/DIM + 1e-5);
+  const qn = new Float32Array(DIM);
+  for (let i = 0; i < DIM; i++)
+    qn[i] = (a*stepRmsA[s][i] + b*stepRmsB[s][i]) * query[i] * rmsInv;
+
+  // SwiGLU
+  const gate = new Float32Array(HDIM);
+  const up = new Float32Array(HDIM);
+  for (let i = 0; i < HDIM; i++) {
+    let sg = 0, su = 0;
+    for (let j = 0; j < DIM; j++) {
+      sg += (a*stepGateA[s][i*DIM+j] + b*stepGateB[s][i*DIM+j]) * qn[j];
+      su += (a*stepUpA[s][i*DIM+j] + b*stepUpB[s][i*DIM+j]) * qn[j];
+    }
+    gate[i] = sg;
+    up[i] = su;
+  }
+  const swiglu = new Float32Array(HDIM);
+  for (let i = 0; i < HDIM; i++)
+    swiglu[i] = silu(gate[i]) * up[i];
+
+  // Down projection
+  const hidden = new Float32Array(DIM);
+  for (let i = 0; i < DIM; i++) {
+    let sum = 0;
+    for (let j = 0; j < HDIM; j++)
+      sum += (a*stepDownA[s][i*HDIM+j] + b*stepDownB[s][i*HDIM+j]) * swiglu[j];
+    hidden[i] = sum;
+  }
+
+  // Residual
+  const out = new Float32Array(DIM);
+  for (let i = 0; i < DIM; i++) out[i] = qn[i] + hidden[i];
+
+  // Score each word in extVocab via embed_in (not embed_out)
+  // For each word: score = mean of dot(blended_embed_in[tok], out) over its BPE tokens
+  const logits = new Float32Array(extVocab.length);
+  for (let w = 0; w < extVocab.length; w++) {
+    const ids = extVocab[w].bpeIds;
+    const bpeLen = ids.length || 1;
+    let score = 0;
+    for (const tid of ids) {
+      if (tid >= BPE_VOCAB) continue;
+      let dot = 0;
+      for (let d = 0; d < DIM; d++)
+        dot += (a * embed_in_A[tid*DIM+d] + b * embed_in_B[tid*DIM+d]) * out[d];
+      score += dot;
+    }
+    logits[w] = score / bpeLen;
+  }
+
+  return logits;
+}
+
 // ═══ DARIO OVERLAY — heuristic forces applied on top of learned logits ═══
 
-function darioOverlay(logits, wordContext, prevWord, stepIdx, direction) {
+// vocabForOverlay: array of {word, origIdx} — tells darioOverlay which words
+// are in the logits array and what their original WORDS[] index is (for bigram/cooc lookup).
+// For untrained mode: [{word: WORDS[i], origIdx: i}, ...] (length=NWORDS)
+// For trained mode: extVocab entries (origIdx=-1 for BPE-derived words — no bigram/cooc data)
+
+function darioOverlay(logits, wordContext, prevWord, stepIdx, direction, vocabForOverlay) {
   const alpha_mod = 1 + 0.3*chambers[CH.LOVE] - 0.2*chambers[CH.RAGE] + 0.1*chambers[CH.FLOW];
   const gamma_mod = 1 + 0.4*chambers[CH.VOID] + 0.2*chambers[CH.COMPLEX];
   const calMod = 1 + 0.2 * calendarDissonance(calendarDaysSinceEpoch());
@@ -683,13 +851,18 @@ function darioOverlay(logits, wordContext, prevWord, stepIdx, direction) {
   const h_g = silu(gateR * 2);
   const f_g = silu(gateR * 1.5);
 
-  for (let v = 0; v < NWORDS; v++) {
+  const nVocab = vocabForOverlay.length;
+  for (let v = 0; v < nVocab; v++) {
+    const oi = vocabForOverlay[v].origIdx;
     let B = 0;
-    if (prevWord >= 0) B = Math.log(1 + getBigram(prevWord, v)) * 4;
+    // Bigram/cooc only available for words that exist in WORDS[] (origIdx >= 0)
+    if (oi >= 0 && prevWord >= 0) B = Math.log(1 + getBigram(prevWord, oi)) * 4;
 
     let H = 0;
-    for (const c of wordContext) H += Math.log(1 + getCooc(c, v));
-    H /= (wordContext.length + 1);
+    if (oi >= 0) {
+      for (const c of wordContext) H += Math.log(1 + getCooc(c, oi));
+      H /= (wordContext.length + 1);
+    }
 
     const F = prophecyDebt * (1 + Math.random() * 0.5);
     const A = destinyBias * gamma_mod * 0.5;
@@ -701,16 +874,49 @@ function darioOverlay(logits, wordContext, prevWord, stepIdx, direction) {
 // ═══ WORD SELECTION — forward_step + dario overlay + top-k sampling ═══
 
 function selectWord(bpeContext, wordContext, prevWord, stepIdx, forbidden, direction) {
-  const logits = forwardStep(bpeContext, stepIdx);
-  darioOverlay(logits, wordContext, prevWord, stepIdx, direction);
+  let logits, vocab;
 
-  for (const f of forbidden) logits[f] = -1e9;
+  if (hasWeights && extVocab.length > 0) {
+    // Trained mode: use forwardStepTrained over extended vocab
+    logits = forwardStepTrained(bpeContext, stepIdx);
+    vocab = extVocab;
+  } else {
+    // Untrained mode: use forwardStep over NWORDS hardcoded vocab
+    logits = forwardStep(bpeContext, stepIdx);
+    vocab = [];
+    for (let i = 0; i < NWORDS; i++)
+      vocab.push({ word: WORDS[i], bpeIds: vocabBpe[i], fromHardcoded: true, origIdx: i });
+  }
 
+  darioOverlay(logits, wordContext, prevWord, stepIdx, direction, vocab);
+
+  // Build candidates, applying forbidden filter
+  // forbidden is a Set of WORDS[] indices — for extVocab entries with origIdx >= 0,
+  // check origIdx; for BPE-derived words (origIdx=-1), check word string against
+  // forbidden words set (built lazily)
+  let forbiddenWords = null;
   const indexed = [];
-  for (let i = 0; i < NWORDS; i++)
-    indexed.push({ word: WORDS[i], idx: i, score: logits[i] });
-  indexed.sort((a, b) => b.score - a.score);
+  for (let i = 0; i < vocab.length; i++) {
+    const entry = vocab[i];
+    // Check forbidden by origIdx for hardcoded words
+    if (entry.origIdx >= 0 && forbidden.has(entry.origIdx)) continue;
+    // Check forbidden by word string for BPE-derived words
+    if (entry.origIdx < 0) {
+      if (!forbiddenWords) {
+        forbiddenWords = new Set();
+        for (const fi of forbidden) {
+          if (typeof fi === 'number' && fi >= 0 && fi < NWORDS) forbiddenWords.add(WORDS[fi]);
+          else if (typeof fi === 'string') forbiddenWords.add(fi);
+        }
+      }
+      if (forbiddenWords.has(entry.word)) continue;
+    }
+    indexed.push({ word: entry.word, idx: entry.origIdx >= 0 ? entry.origIdx : -(i+1), extIdx: i, score: logits[i] });
+  }
 
+  if (indexed.length === 0) return { word: 'void', idx: 0, extIdx: 0, score: 0 };
+
+  indexed.sort((a, b) => b.score - a.score);
   const topK = Math.min(8, indexed.length);
   const top = indexed.slice(0, topK);
 
@@ -735,6 +941,17 @@ function extractKey(text) {
     if (sc > bestScore) { bestScore = sc; best = id; }
   }
   return best;
+}
+
+// ═══ HELPER — get BPE ids for a selected word ═══
+function getSelBpeIds(sel) {
+  // Hardcoded word: look up vocabBpe by idx
+  if (sel.idx >= 0 && sel.idx < NWORDS) return vocabBpe[sel.idx];
+  // Extended vocab word: look up extVocab by extIdx
+  if (sel.extIdx !== undefined && sel.extIdx >= 0 && sel.extIdx < extVocab.length)
+    return extVocab[sel.extIdx].bpeIds;
+  // Fallback: BPE encode the word string
+  return bpeEncode(sel.word);
 }
 
 // ═══ BI-DIRECTIONAL REASONING ═══
@@ -791,12 +1008,13 @@ async function runChain(userText) {
       const el = makeWordEl(sel.word, 'backward', `\u2191${nForward+i}`, prophecyDebt, false);
       column.insertBefore(el, column.firstChild); // push to top
 
-      const wb = vocabBpe[sel.idx];
+      // Get BPE ids: from vocabBpe if hardcoded word, from extVocab if extended
+      const wb = getSelBpeIds(sel);
       if (wb) for (const t of wb) bwdBpeCtx.push(t);
-      bwdWordCtx.push(sel.idx);
-      forbidden.add(sel.idx);
+      if (sel.idx >= 0) bwdWordCtx.push(sel.idx);
+      forbidden.add(sel.idx >= 0 ? sel.idx : sel.word);
       prophecyDebt = 0.9 * prophecyDebt + 0.1 * computeProphecyDebt([sel], 0);
-      bwdPrev = sel.idx;
+      bwdPrev = sel.idx >= 0 ? sel.idx : -1;
     }
 
     // Generate FORWARD word (append below origin — grows downward)
@@ -812,15 +1030,17 @@ async function runChain(userText) {
       const el = makeWordEl(sel.word, 'forward', `\u2193${i}`, prophecyDebt, isWormhole);
       column.appendChild(el); // append to bottom
 
-      const wb = vocabBpe[sel.idx];
+      const wb = getSelBpeIds(sel);
       if (wb) for (const t of wb) fwdBpeCtx.push(t);
-      fwdWordCtx.push(sel.idx);
+      if (sel.idx >= 0) fwdWordCtx.push(sel.idx);
 
-      if (fwdPrev >= 0) updateBigram(fwdPrev, sel.idx);
-      for (const c of wordContext) updateCooc(c, sel.idx);
-      forbidden.add(sel.idx);
+      if (sel.idx >= 0 && fwdPrev >= 0) updateBigram(fwdPrev, sel.idx);
+      if (sel.idx >= 0) {
+        for (const c of wordContext) updateCooc(c, sel.idx);
+      }
+      forbidden.add(sel.idx >= 0 ? sel.idx : sel.word);
       prophecyDebt = 0.9 * prophecyDebt + 0.1 * computeProphecyDebt([sel], 0);
-      fwdPrev = sel.idx;
+      fwdPrev = sel.idx >= 0 ? sel.idx : -1;
     }
 
     // Both directions appear at the same tick
@@ -858,10 +1078,64 @@ function updateMetrics() {
   const diss = calendarDissonance(days).toFixed(3);
   const pd = personalDissonance().toFixed(3);
   const blend = getBlendAlpha().toFixed(3);
+  const wMode = hasWeights ? 'TRAINED' : 'dario';
+  const extN = extVocab.length;
   document.getElementById('metrics').textContent =
     `drift=${drift}  diss=${diss}  personal=${pd}  blend=${blend}  ` +
     `debt=${prophecyDebt.toFixed(3)}  prophecy_acc=${META.prophecyAccuracy.toFixed(3)}  ` +
-    `bpe=${BPE_VOCAB}  words=${NWORDS}`;
+    `bpe=${BPE_VOCAB}  words=${NWORDS}  ext=${extN}  mode=${wMode}`;
+}
+
+// ═══ WEIGHT LOADING — sets hasWeights=true when trained weights are available ═══
+// Expects an ArrayBuffer of float32 values laid out as:
+//   embed_in_A[BPE_VOCAB*DIM] + embed_in_B[BPE_VOCAB*DIM] +
+//   embed_out_A[NWORDS*DIM] + embed_out_B[NWORDS*DIM] +
+//   for each step s in 0..STEPS-1:
+//     stepWrA[s][DIM*DIM] + stepWrB[s][DIM*DIM] +
+//     stepRmsA[s][DIM] + stepRmsB[s][DIM] +
+//     stepGateA[s][HDIM*DIM] + stepUpA[s][HDIM*DIM] + stepDownA[s][DIM*HDIM] +
+//     stepGateB[s][HDIM*DIM] + stepUpB[s][HDIM*DIM] + stepDownB[s][DIM*HDIM]
+
+async function loadWeights(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    const f32 = new Float32Array(buf);
+    let off = 0;
+
+    function readSlice(len) {
+      const slice = f32.subarray(off, off + len);
+      off += len;
+      return slice;
+    }
+
+    embed_in_A = new Float32Array(readSlice(BPE_VOCAB * DIM));
+    embed_in_B = new Float32Array(readSlice(BPE_VOCAB * DIM));
+    embed_out_A = new Float32Array(readSlice(NWORDS * DIM));
+    embed_out_B = new Float32Array(readSlice(NWORDS * DIM));
+
+    for (let s = 0; s < STEPS; s++) {
+      stepWrA[s] = new Float32Array(readSlice(DIM * DIM));
+      stepWrB[s] = new Float32Array(readSlice(DIM * DIM));
+      stepRmsA[s] = new Float32Array(readSlice(DIM));
+      stepRmsB[s] = new Float32Array(readSlice(DIM));
+      stepGateA[s] = new Float32Array(readSlice(HDIM * DIM));
+      stepUpA[s] = new Float32Array(readSlice(HDIM * DIM));
+      stepDownA[s] = new Float32Array(readSlice(DIM * HDIM));
+      stepGateB[s] = new Float32Array(readSlice(HDIM * DIM));
+      stepUpB[s] = new Float32Array(readSlice(HDIM * DIM));
+      stepDownB[s] = new Float32Array(readSlice(DIM * HDIM));
+    }
+
+    hasWeights = true;
+    buildExtendedVocab(); // rebuild in case vocab changed
+    console.log('[nanojanus] weights loaded: ' + f32.length + ' floats from ' + url + ', hasWeights=true');
+    updateMetrics();
+  } catch(e) {
+    console.error('[nanojanus] weight loading failed: ' + e.message);
+    hasWeights = false;
+  }
 }
 
 // Training is done via nanojanus.py (CLI). No in-browser training.

@@ -168,6 +168,65 @@ VOCAB_LENS = []
 NWORDS = 0
 vocab_bpe = []  # precomputed BPE encoding for each vocabulary word
 
+# Extended vocabulary: hardcoded words + whole words discovered in BPE vocab
+ext_vocab = []   # list of {'word': str, 'bpe_ids': list[int], 'from_hardcoded': bool}
+ext_vocab_n = 0
+has_weights = False  # set True after load_weights succeeds
+
+
+def bpe_decode_token(token_id):
+    """Decode a single BPE token ID back to its string.
+    IDs 0-255 are raw bytes; 256+ are merge results."""
+    if token_id < 0 or token_id >= BPE_VOCAB:
+        return None
+    if token_id < 256:
+        if 32 <= token_id < 127:
+            return chr(token_id)
+        return None  # non-printable
+    merge_idx = token_id - 256
+    if merge_idx >= len(BPE_TABLE):
+        return None
+    left, right = BPE_TABLE[merge_idx]
+    left_s = bpe_decode_token(left)
+    right_s = bpe_decode_token(right)
+    if left_s is None or right_s is None:
+        return None
+    return left_s + right_s
+
+
+def build_extended_vocab():
+    """Build extended vocab: hardcoded words + whole words from BPE tokens."""
+    global ext_vocab, ext_vocab_n
+    ext_vocab = []
+    seen_words = set()
+
+    # First: all hardcoded words from nanojanus.txt
+    for i, w in enumerate(WORDS):
+        ext_vocab.append({'word': w, 'bpe_ids': vocab_bpe[i], 'from_hardcoded': True})
+        seen_words.add(w)
+
+    # Second: scan all BPE token IDs for whole words
+    bpe_added = 0
+    for tid in range(BPE_VOCAB):
+        s = bpe_decode_token(tid)
+        if s is None:
+            continue
+        s = s.strip()  # strip leading/trailing spaces from merged tokens
+        if len(s) < 2:
+            continue
+        if not s.isalpha() or not s.islower():
+            continue
+        if s in seen_words:
+            continue
+        bpe_ids = bpe_encode(s)
+        ext_vocab.append({'word': s, 'bpe_ids': bpe_ids, 'from_hardcoded': False})
+        seen_words.add(s)
+        bpe_added += 1
+
+    ext_vocab_n = len(ext_vocab)
+    n_hardcoded = NWORDS
+    print(f'extended vocab: {ext_vocab_n} words ({n_hardcoded} hardcoded + {bpe_added} from BPE)')
+
 
 def load_vocabulary(vocab_path):
     """Load vocabulary from nanojanus.txt (one word per line)."""
@@ -178,6 +237,8 @@ def load_vocabulary(vocab_path):
     NWORDS = len(WORDS)
     # Precompute BPE encoding for each word in vocabulary
     vocab_bpe = [bpe_encode(w) for w in WORDS]
+    # Build extended vocabulary from hardcoded + BPE-discovered words
+    build_extended_vocab()
 
 
 def try_stem(word):
@@ -507,12 +568,101 @@ def forward_step(bpe_ids, step_idx):
     return logits
 
 
+def forward_step_trained(bpe_ids, step_idx):
+    """RRPRAM forward with extended vocab output via embed_in projection.
+
+    Identical to forward_step through the RRPRAM computation (ctx -> Wr ->
+    RMSNorm -> SwiGLU -> residual -> out), but scores each extended vocab word
+    by averaging the dot products of its BPE token embeddings (from embed_in)
+    with the output vector. This lets the model output any word whose BPE
+    tokens exist in embed_in, not just the NWORDS hardcoded words."""
+    s = step_idx % STEPS
+    a = get_blend_alpha()
+    b = 1.0 - a
+
+    # Pool context: average blended embed_in over all BPE tokens
+    ctx = [0.0] * DIM
+    n = len(bpe_ids) if bpe_ids else 1
+    for tok_id in bpe_ids:
+        if tok_id >= BPE_VOCAB:
+            continue
+        base = tok_id * DIM
+        for d in range(DIM):
+            ctx[d] += a * embed_in_A[base + d] + b * embed_in_B[base + d]
+    inv = 1.0 / n
+    for d in range(DIM):
+        ctx[d] *= inv
+
+    # RRPRAM: query = ctx @ Wr (blended)
+    query = [0.0] * DIM
+    for i in range(DIM):
+        acc = 0.0
+        for j in range(DIM):
+            acc += (a * step_wr_a[s][i * DIM + j] + b * step_wr_b[s][i * DIM + j]) * ctx[j]
+        query[i] = acc
+
+    # RMSNorm
+    ss = sum(q * q for q in query)
+    rms_inv = 1.0 / math.sqrt(ss / DIM + 1e-5)
+    qn = [(a * step_rms_a[s][i] + b * step_rms_b[s][i]) * query[i] * rms_inv
+          for i in range(DIM)]
+
+    # SwiGLU: gate[HDIM] = W_gate[HDIM,DIM] @ qn[DIM]
+    gate = [0.0] * HDIM
+    up = [0.0] * HDIM
+    for i in range(HDIM):
+        sg = 0.0
+        su = 0.0
+        for j in range(DIM):
+            sg += (a * step_gate_a[s][i * DIM + j] + b * step_gate_b[s][i * DIM + j]) * qn[j]
+            su += (a * step_up_a[s][i * DIM + j] + b * step_up_b[s][i * DIM + j]) * qn[j]
+        gate[i] = sg
+        up[i] = su
+
+    swiglu = [silu(gate[i]) * up[i] for i in range(HDIM)]
+
+    # Down: hidden[DIM] = W_down[DIM,HDIM] @ swiglu[HDIM]
+    hidden = [0.0] * DIM
+    for i in range(DIM):
+        acc = 0.0
+        for j in range(HDIM):
+            acc += (a * step_down_a[s][i * HDIM + j] + b * step_down_b[s][i * HDIM + j]) * swiglu[j]
+        hidden[i] = acc
+
+    # Residual
+    out = [qn[i] + hidden[i] for i in range(DIM)]
+
+    # Logits via embed_in projection: for each ext_vocab word, average the
+    # dot products of its BPE token embeddings with the output vector
+    logits = [0.0] * ext_vocab_n
+    for w in range(ext_vocab_n):
+        bpe_toks = ext_vocab[w]['bpe_ids']
+        bl = len(bpe_toks)
+        if bl == 0:
+            continue
+        score = 0.0
+        for tok in bpe_toks:
+            if tok >= BPE_VOCAB:
+                continue
+            base = tok * DIM
+            dot = sum((a * embed_in_A[base + d] + b * embed_in_B[base + d]) * out[d] for d in range(DIM))
+            score += dot
+        logits[w] = score / bl
+
+    return logits
+
+
 # ===================================================================
 # DARIO OVERLAY -- heuristic forces applied on top of learned logits
 # ===================================================================
 
-def dario_overlay(logits, word_context, prev_word, step_idx, direction):
-    """Apply Hebbian co-occurrence, Prophecy, Destiny overlay on top of learned logits."""
+def dario_overlay(logits, word_context, prev_word, step_idx, direction, use_ext=False):
+    """Apply Hebbian co-occurrence, Prophecy, Destiny overlay on top of learned logits.
+
+    When use_ext=True, operates over ext_vocab (extended vocabulary). Dario co-occurrence
+    and bigram data only exists for the hardcoded NWORDS portion (indices < NWORDS in
+    ext_vocab map 1:1 to WORDS indices), so overlay is applied to those; BPE-discovered
+    words (indices >= NWORDS) get only the Prophecy + Destiny baseline."""
     alpha_mod = 1.0 + 0.3 * chambers[CH_LOVE] - 0.2 * chambers[CH_RAGE] + 0.1 * chambers[CH_FLOW]
     gamma_mod = 1.0 + 0.4 * chambers[CH_VOID] + 0.2 * chambers[CH_COMPLEX]
     cal_mod = 1.0 + 0.2 * calendar_dissonance(calendar_days_since_epoch())
@@ -521,17 +671,22 @@ def dario_overlay(logits, word_context, prev_word, step_idx, direction):
     h_g = silu(gate_r * 2)
     f_g = silu(gate_r * 1.5)
 
-    for v in range(NWORDS):
+    n_logits = ext_vocab_n if use_ext else NWORDS
+    for v in range(n_logits):
+        # For ext_vocab, only the first NWORDS entries have co-occurrence / bigram data
+        is_hardcoded = v < NWORDS
+
         # B: bigram transition
         B = 0.0
-        if prev_word >= 0:
+        if prev_word >= 0 and is_hardcoded:
             B = math.log(1 + get_bigram(prev_word, v)) * 4
 
         # H: Hebbian co-occurrence
         H = 0.0
-        for c in word_context:
-            H += math.log(1 + get_cooc(c, v))
-        H /= (len(word_context) + 1)
+        if is_hardcoded:
+            for c in word_context:
+                H += math.log(1 + get_cooc(c, v))
+            H /= (len(word_context) + 1)
 
         # F: Prophecy fulfillment (scaled by debt)
         F = prophecy_debt * (1.0 + random.random() * 0.5)
@@ -547,16 +702,45 @@ def dario_overlay(logits, word_context, prev_word, step_idx, direction):
 # ===================================================================
 
 def select_word(bpe_context, word_context, prev_word, step_idx, forbidden, direction):
-    """Run RRPRAM forward step, apply Dario overlay, sample from top-k."""
-    logits = forward_step(bpe_context, step_idx)
-    dario_overlay(logits, word_context, prev_word, step_idx, direction)
+    """Run RRPRAM forward step, apply Dario overlay, sample from top-k.
 
-    # Mask forbidden words
-    for f in forbidden:
-        logits[f] = -1e9
+    When has_weights is True, uses forward_step_trained (ext_vocab via embed_in
+    projection) instead of forward_step (embed_out, NWORDS only). Forbidden
+    masking works by word string to handle differing index spaces."""
+    if has_weights:
+        logits = forward_step_trained(bpe_context, step_idx)
+        dario_overlay(logits, word_context, prev_word, step_idx, direction, use_ext=True)
 
-    # Build scored candidates
-    indexed = [{'word': WORDS[i], 'idx': i, 'score': logits[i]} for i in range(NWORDS)]
+        # Build forbidden word set by string for ext_vocab matching.
+        # forbidden may contain original NWORDS indices (e.g. seed_idx)
+        # and ext_vocab indices from previous select_word calls.
+        forbidden_words = set()
+        for f in forbidden:
+            if f < ext_vocab_n:
+                forbidden_words.add(ext_vocab[f]['word'])
+            elif f < NWORDS:
+                forbidden_words.add(WORDS[f])
+
+        # Mask forbidden words by string
+        for i in range(ext_vocab_n):
+            if ext_vocab[i]['word'] in forbidden_words:
+                logits[i] = -1e9
+
+        # Build scored candidates from ext_vocab
+        indexed = [{'word': ext_vocab[i]['word'], 'idx': i, 'score': logits[i]}
+                   for i in range(ext_vocab_n)]
+    else:
+        logits = forward_step(bpe_context, step_idx)
+        dario_overlay(logits, word_context, prev_word, step_idx, direction)
+
+        # Mask forbidden words by index
+        for f in forbidden:
+            if f < NWORDS:
+                logits[f] = -1e9
+
+        # Build scored candidates
+        indexed = [{'word': WORDS[i], 'idx': i, 'score': logits[i]} for i in range(NWORDS)]
+
     indexed.sort(key=lambda s: s['score'], reverse=True)
 
     top_k = min(8, len(indexed))
@@ -661,7 +845,10 @@ def run_chain(user_text):
             all_steps.append(sel)
 
             # Extend backward BPE context with selected word's BPE tokens
-            wb = vocab_bpe[sel['idx']]
+            if has_weights:
+                wb = ext_vocab[sel['idx']]['bpe_ids']
+            else:
+                wb = vocab_bpe[sel['idx']]
             if wb:
                 bwd_bpe_ctx.extend(wb)
             bwd_word_ctx.append(sel['idx'])
@@ -686,15 +873,19 @@ def run_chain(user_text):
             all_steps.append(sel)
 
             # Extend forward BPE context
-            wb = vocab_bpe[sel['idx']]
+            if has_weights:
+                wb = ext_vocab[sel['idx']]['bpe_ids']
+            else:
+                wb = vocab_bpe[sel['idx']]
             if wb:
                 fwd_bpe_ctx.extend(wb)
             fwd_word_ctx.append(sel['idx'])
 
-            if fwd_prev >= 0:
+            if fwd_prev >= 0 and sel['idx'] < NWORDS and fwd_prev < NWORDS:
                 update_bigram(fwd_prev, sel['idx'])
             for c in word_context:
-                update_cooc(c, sel['idx'])
+                if sel['idx'] < NWORDS:
+                    update_cooc(c, sel['idx'])
             forbidden.add(sel['idx'])
             prophecy_debt = 0.9 * prophecy_debt + 0.1 * compute_prophecy_debt([sel], 0)
             fwd_prev = sel['idx']
@@ -738,7 +929,7 @@ def display_metrics():
     print(f"\ndrift={drift:.2f}  diss={diss:.3f}  personal={pd:.3f}  "
           f"blend={blend:.3f}  debt={prophecy_debt:.3f}  "
           f"prophecy_acc={META.prophecy_accuracy:.3f}  "
-          f"bpe={BPE_VOCAB}  words={NWORDS}")
+          f"bpe={BPE_VOCAB}  words={NWORDS}  ext_vocab={ext_vocab_n}  trained={has_weights}")
 
 
 # ===================================================================
@@ -963,6 +1154,7 @@ def load_weights(path=WEIGHTS_FILE):
     global step_wr_a, step_wr_b, step_rms_a, step_rms_b
     global step_gate_a, step_up_a, step_down_a
     global step_gate_b, step_up_b, step_down_b
+    global has_weights
 
     if not os.path.exists(path):
         return False
@@ -997,6 +1189,7 @@ def load_weights(path=WEIGHTS_FILE):
     meta = data.get('meta', {})
     META.prophecy_accuracy = meta.get('prophecy_accuracy', 0.5)
     META.total_predictions = meta.get('total_predictions', 0)
+    has_weights = True
     print(f'Weights loaded from {path}')
     return True
 
