@@ -177,8 +177,9 @@ When `prophecy_debt < 0.2` and `wormhole > 0.1`, the organism may skip 1–3 ste
 | `metajanus.c` | Char-level (256) | 256 | Janus only (pure) | ~37.6M × 2 (dual) |
 | `resonance-janus-bpe.c` | BPE (configurable) | 2048 | QKV + RRPRAM + Janus | ~24M × 2 (dual, depth-12) |
 | `nanojanus.html` | BPE→Word | 2048/1984 | QKV + RRPRAM (2-way gate) | 19,619,280 (single) |
+| `nanojanus.py` | BPE→Word | 2048/1984 | QKV + RRPRAM (2-way gate) | 19,619,280 (single) |
 
-The C implementations use dual weight matrices (A/B) blended by calendar state. NanoJanus (`nanojanus.html`) uses a single weight set with Dario equation overlay. `nanojanus.py` is referenced in CASCADE01.md but is not present in this repository; the HTML version is the active implementation.
+The C implementations use dual weight matrices (A/B) blended by calendar state. NanoJanus (`nanojanus.html` and `nanojanus.py`) uses a single weight set with Dario equation overlay. `nanojanus.py` is the Python CLI implementation — it mirrors `nanojanus.html` (same architecture, same PEN7 weight format) but adds training support via AdamW optimizer.
 
 ## Guardian Notes
 

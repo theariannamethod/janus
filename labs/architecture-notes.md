@@ -1,8 +1,9 @@
 # NanoJanus Architecture Notes
 
 Technical reference for the Janus architecture as implemented across
-`nanojanus.html`, the C modules (`janus.c`, `janus-hybrid.c`, `janus-bpe.c`,
-`metajanus.c`, `resonance-janus-bpe.c`), and the vocabulary file `nanojanus.txt`.
+`nanojanus.py`, `nanojanus.html`, the C modules (`janus.c`, `janus-hybrid.c`,
+`janus-bpe.c`, `metajanus.c`, `resonance-janus-bpe.c`), and the vocabulary
+file `nanojanus.txt`.
 
 Cross-referenced against **CASCADE01.md** (`ariannamethod/ariannamethod`,
 path `cascade/cascade1/CASCADE01.md`).
@@ -12,8 +13,8 @@ path `cascade/cascade1/CASCADE01.md`).
 ## 1. Janus Self-Resonance: Wj^T · Wj Echo Math
 
 Janus self-resonance is the novel introspective attention mechanism. It is
-implemented in all C files but **not** in `nanojanus.html` (which uses QKV +
-RRPRAM only).
+implemented in all C files but **not** in `nanojanus.html` or `nanojanus.py`
+(which use QKV + RRPRAM only).
 
 ### Definition
 
@@ -74,8 +75,9 @@ simultaneously to the past and future.
 
 ### Origin Finding
 
-`extractKey()` (`nanojanus.html` line ~971) selects the most "charged" word
-from the input by summing co-occurrence scores:
+`extractKey()` (`nanojanus.html` line ~971; `nanojanus.py` `extract_key()` line
+~836) selects the most "charged" word from the input by summing co-occurrence
+scores:
 
 ```javascript
 for (const id of inputWordIds) {
@@ -98,7 +100,8 @@ Clamped: `n_backward ∈ [1, STEPS−1]`, `n_forward ∈ [1, STEPS−1]`.
 - Low prophecy debt → more forward steps (confident, predictive)
 - High calendar dissonance → more backward steps
 
-(`nanojanus.html` lines ~1009–1011; `janus.c` lines ~1156–1163)
+(`nanojanus.html` lines ~1009–1011; `nanojanus.py` `run_chain()` line ~857;
+`janus.c` lines ~1156–1163)
 
 ### Temperature
 
@@ -108,7 +111,7 @@ Clamped: `n_backward ∈ [1, STEPS−1]`, `n_forward ∈ [1, STEPS−1]`.
 predicted_entropy = 0.5 + 0.2 × prophecy_debt + 0.1 × cal_dissonance + 0.15 × personal_dissonance
 ```
 
-(`nanojanus.html` line ~1006)
+(`nanojanus.html` line ~1006; `nanojanus.py` `run_chain()` line ~857)
 
 In the C implementation (`janus.c`), explicit per-step temperature scaling:
 
@@ -157,14 +160,14 @@ temporal heartbeat of the organism.
 
 ### Constants
 
-| Constant | Value | `nanojanus.html` line | `janus.c` line |
-|----------|-------|-----------------------|----------------|
-| `AM_ANNUAL_DRIFT` | 11.25 days/year | ~522 | ~64 |
-| `AM_GREGORIAN_YEAR` | 365.25 days | ~523 | ~65 |
-| `AM_METONIC_YEARS` | 19 years | ~524 | ~66 |
-| `AM_METONIC_LEAPS` | 7 leap months | ~525 | ~67 |
-| `AM_MAX_UNCORRECTED` | 33.0 days | ~526 | ~68 |
-| Epoch | Oct 3, 2024, 12:00 UTC | ~528 | ~80 |
+| Constant | Value | `nanojanus.html` line | `nanojanus.py` line | `janus.c` line |
+|----------|-------|-----------------------|----------------------|----------------|
+| `AM_ANNUAL_DRIFT` | 11.25 days/year | ~522 | ~309 | ~64 |
+| `AM_GREGORIAN_YEAR` | 365.25 days | ~523 | ~310 | ~65 |
+| `AM_METONIC_YEARS` | 19 years | ~524 | ~311 | ~66 |
+| `AM_METONIC_LEAPS` | 7 leap months | ~525 | ~312 | ~67 |
+| `AM_MAX_UNCORRECTED` | 33.0 days | ~526 | ~313 | ~68 |
+| Epoch | Oct 3, 2024, 12:00 UTC | ~528 | ~315 | ~80 |
 
 ### Metonic Cycle
 
@@ -195,6 +198,7 @@ cumulative_drift = base_drift − corrections
 ```
 
 (`nanojanus.html` `calendarCumulativeDrift()` lines ~534–544;
+`nanojanus.py` `calendar_cumulative_drift()` line ~309;
 `janus.c` `calendar_cumulative_drift()` lines ~96–108)
 
 ### Dissonance Formula
@@ -203,7 +207,8 @@ cumulative_drift = base_drift − corrections
 dissonance = clamp(|cumulative_drift mod 33| / 33, 0, 1)
 ```
 
-(`nanojanus.html` line ~548; `janus.c` lines ~110–114)
+(`nanojanus.html` line ~548; `nanojanus.py` `calendar_dissonance()` line ~322;
+`janus.c` lines ~110–114)
 
 ### What Calendar Dissonance Modulates
 
@@ -232,7 +237,8 @@ META = {
 }
 ```
 
-(`nanojanus.html` lines ~553–560)
+(`nanojanus.html` lines ~553–560; `nanojanus.py` META dict initialized at
+startup with equivalent fields)
 
 ### Personal Dissonance
 
@@ -243,6 +249,7 @@ personal_dissonance = clamp(|current_drift − birth_drift| / 33, 0, 1)
 Measures how far the organism has drifted from its birth state.
 
 (`nanojanus.html` `personalDissonance()` lines ~562–565;
+`nanojanus.py` `personal_dissonance()` line ~345;
 `janus.c` / `metajanus.c` `metajanus_personal_dissonance()` lines ~142–146)
 
 ### Prophecy Accuracy
@@ -256,7 +263,8 @@ prophecy_accuracy = 0.9 × prophecy_accuracy + 0.1 × (1 − error)
 total_predictions += 1
 ```
 
-(`nanojanus.html` lines ~1082–1087)
+(`nanojanus.html` lines ~1082–1087; `nanojanus.py` `run_chain()` post-generation
+evaluation)
 
 `metajanus.c` extends this with a dedicated internal prophecy system:
 `metajanus_prophecy()` predicts entropy before generation, and
@@ -266,9 +274,10 @@ total_predictions += 1
 
 ## 5. RRPRAM + QKV + Janus: Gate Mechanisms
 
-### nanojanus.html — 2-Way Gate (QKV + RRPRAM)
+### nanojanus.html / nanojanus.py — 2-Way Gate (QKV + RRPRAM)
 
-Per layer, two mechanisms are computed and blended:
+Per layer, two mechanisms are computed and blended (identical architecture in
+both implementations):
 
 1. **QKV attention**: Q, K, V projections with RoPE, scaled dot-product,
    causal masking, output projection through `wo`
@@ -281,7 +290,9 @@ Gate blend (per layer, 2 learnable scalars):
 x = x + w0 × qkvOut + w1 × rrpOut
 ```
 
-(`nanojanus.html` lines ~762–771; weight: `lw.gate = readFloats(2)` at line ~867)
+(`nanojanus.html` lines ~762–771; `nanojanus.py` lines ~607–611;
+weight: `lw.gate = readFloats(2)` at line ~867 / `self.gate = [0.0, 0.0]` at
+line ~455)
 
 ### C Implementations — 3-Way Gate (QKV + RRPRAM + Janus)
 
@@ -302,7 +313,7 @@ head_out = α × QKV_out + β × RRPRAM_out + γ × Janus_out
 
 ### Key Differences
 
-| Feature | `nanojanus.html` | C implementations |
+| Feature | `nanojanus.html` / `nanojanus.py` | C implementations |
 |---------|-------------------|-------------------|
 | Gate granularity | Per layer (2 scalars) | Per head (H×3 logits) |
 | Mechanisms | QKV + RRPRAM | QKV + RRPRAM + Janus |
@@ -397,6 +408,7 @@ logits[v] += (B + α_mod × 3 × H × h_g + 2 × F × f_g + A) × dirMod × calM
 ```
 
 (`nanojanus.html` `darioOverlay()` lines ~884–910;
+`nanojanus.py` `dario_overlay()` line ~727;
 `janus.c` `dario_overlay()` lines ~1018–1048)
 
 ---
@@ -416,7 +428,8 @@ Six coupled emotional oscillators govern the Dario equation modulation.
 | 4 | FLOW | 0.94 | Amplifies Hebbian (α_mod +0.1) |
 | 5 | COMPLEX | 0.97 | Amplifies Destiny (γ_mod +0.2) |
 
-(`nanojanus.html` lines ~583–585; `janus.c` lines ~212–214)
+(`nanojanus.html` lines ~583–585; `nanojanus.py` `update_chambers()` line ~384;
+`janus.c` lines ~212–214)
 
 ### Update Rule
 
@@ -442,6 +455,7 @@ for each chamber i:
 ```
 
 (`nanojanus.html` `updateChambers()` lines ~587–600;
+`nanojanus.py` `update_chambers()` lines ~384–412;
 `janus.c` `update_chambers()` lines ~216–234)
 
 This is a discrete Kuramoto model: oscillators pull each other toward phase
@@ -461,7 +475,8 @@ the transformer, and curated words (1984 from `nanojanus.txt`) for output.
 2. **Stem match**: try common suffixes (-s, -ed, -ing, -ly, etc.)
 3. **Greedy BPE decomposition**: character-by-character merge
 
-(`nanojanus.html` `tokenizeWords()` lines ~508–520, `tryStem()` lines ~498–506)
+(`nanojanus.html` `tokenizeWords()` lines ~508–520, `tryStem()` lines ~498–506;
+`nanojanus.py` `bpe_encode()` line ~147)
 
 ### BPE String Building
 
@@ -594,9 +609,9 @@ The C implementations use a different format:
 
 ### Architecture Comparison
 
-| Feature | `nanojanus.html` | C files (`janus.c` etc.) |
-|---------|-------------------|--------------------------|
-| **Language** | JavaScript (browser) | C (compiled) |
+| Feature | `nanojanus.html` / `nanojanus.py` | C files (`janus.c` etc.) |
+|---------|-----------------------------------|--------------------------|
+| **Language** | JavaScript (browser) / Python (CLI) | C (compiled) |
 | **Parameters** | 19.6M (single) | Varies: 6.5M–37.6M (×2 dual) |
 | **Attention** | QKV + RRPRAM (2-way) | QKV + RRPRAM + Janus (3-way) |
 | **Gate** | Per-layer, 2 scalars | Per-head, H×3 logits |
@@ -609,8 +624,8 @@ The C implementations use a different format:
 | **Dario overlay** | Full 7-force | Full in janus.c, partial in others |
 | **Kuramoto chambers** | 6 chambers | 6 chambers |
 | **Calendar drift** | Identical | Identical |
-| **Optimizer** | None (inference only) | Chuck optimizer |
-| **Training** | Not supported | Full forward/backward |
+| **Optimizer** | AdamW (`nanojanus.py` only) | Chuck optimizer |
+| **Training** | Supported (`nanojanus.py` `train_on_text()`) | Full forward/backward |
 | **Weight format** | PEN7 | Custom binary (magic 0x4A414E55) |
 | **Wormhole** | Visual indicator only | Actual step skipping |
 
@@ -640,8 +655,39 @@ The C implementations use a different format:
 ### Shared Constants (C files)
 
 All C files share: `DIM=384, HEADS=4, HEAD_DIM=96, BLOCKS=12, MLP_DIM=768,
-MAX_T=256`. These differ from `nanojanus.html` (`DIM=448, N_HEADS=7,
-HEAD_DIM=64, N_LAYERS=8, HDIM=896`).
+MAX_T=256`. These differ from `nanojanus.html` / `nanojanus.py` (`DIM=448,
+N_HEADS=7, HEAD_DIM=64, N_LAYERS=8, HDIM=896`).
+
+### nanojanus.py: Training Support
+
+`nanojanus.py` is the Python CLI equivalent of `nanojanus.html`. Same
+architecture (QKV + RRPRAM, 2-way gate, PEN7 weights) but adds training:
+
+**Key functions:**
+- `forward(bpe_ids)` (line ~541): Full 8-layer forward pass
+- `train_on_text(text, total_steps, lr, wd)` (line ~1023): BPE next-token
+  prediction with analytical backward pass
+- `save_weights(path)` (line ~1267): PEN7 binary export
+- `load_weights(path)` (line ~1315): PEN7 binary import
+- `dario_overlay(logits, ...)` (line ~727): 7-force overlay
+- `extract_key(text)` (line ~836): Origin word selection
+- `run_chain(user_text)` (line ~857): Bidirectional generation loop
+
+**Optimizer**: AdamW (β1=0.9, β2=0.999, ε=1e-8, line ~1013). Explicitly
+**not** Chuck — `nanojanus.py` line ~1027: `"No Chuck."` The Chuck optimizer
+is C-only (`janus.c` lines ~464–477).
+
+**Training loop** (`train_on_text()`, line ~1023):
+1. Random context window (4–32 BPE tokens)
+2. Forward pass through 8-layer Resonance engine
+3. Cross-entropy loss on next-token prediction
+4. Analytical gradient computation for tok_emb, lm_head, final_norm,
+   and per-layer weights
+5. AdamW update with weight decay
+
+**Save format**: PEN7 binary (magic `0x50454E37`), identical header to
+`nanojanus.html` `loadWeightsPEN7()`. Includes co-occurrence maps, bigram
+data, and MetaJanus birth state after the weight payload.
 
 ---
 
@@ -654,17 +700,19 @@ CASCADE01.md states:
 > Janus self-resonance attention.
 
 The 19.6M parameter count, 8 layers, DIM=448, and 7 heads match
-`nanojanus.html`. However, the "PLUS Janus self-resonance" is aspirational —
-`nanojanus.html` implements QKV + RRPRAM (2-way gate) without the Wj matrix.
-The full 3-way attention (including Janus self-resonance) exists only in the C
-implementations, which use different dimensions (DIM=384, HEADS=4).
+`nanojanus.html` and `nanojanus.py`. However, the "PLUS Janus self-resonance"
+is aspirational — `nanojanus.html` and `nanojanus.py` implement QKV + RRPRAM
+(2-way gate) without the Wj matrix. The full 3-way attention (including Janus
+self-resonance) exists only in the C implementations, which use different
+dimensions (DIM=384, HEADS=4).
 
 **Status**: This is a documentation-vs-implementation gap, not a bug.
-CASCADE01.md describes the intended architecture; `nanojanus.html` implements
-the operational subset needed for the daily cascade. If Janus self-resonance
-is added to `nanojanus.html` in the future, the PEN7 weight format would need
-a Wj matrix per layer and the gate would expand from 2 to 3 values. This file
-(`labs/`) does not modify CASCADE01.md — that lives in `ariannamethod/ariannamethod`.
+CASCADE01.md describes the intended architecture; `nanojanus.html` /
+`nanojanus.py` implement the operational subset needed for the daily cascade.
+If Janus self-resonance is added in the future, the PEN7 weight format would
+need a Wj matrix per layer and the gate would expand from 2 to 3 values. This
+file (`labs/`) does not modify CASCADE01.md — that lives in
+`ariannamethod/ariannamethod`.
 
 CASCADE01.md's daily cycle timing (NanoJanus at 06:30 UTC), input sources
 (Haiku + Penelope + Molequla), output format (12 bidirectional words), and
