@@ -253,9 +253,9 @@ When the system is confident (low prophecy debt):
 
 Unlike Penelope (from [1984](https://github.com/ariannamethod/1984)) which takes word-level steps, Janus takes sentence-level steps. Each step produces a complete thought, allowing the bi-directional reasoning to build coherent temporal narratives rather than word chains.
 
-## Janus 285M — Trained Bilingual Model
+## Janus 285M — Trained Model
 
-**Anti-Chinchilla anomaly: 30% of optimal data, coherent bilingual generation.**
+**Anti-Chinchilla anomaly: 30% of optimal data, coherent English generation.**
 
 The first large-scale Janus pretrain demonstrates that 3-way attention is more sample-efficient than standard transformers.
 
@@ -275,7 +275,7 @@ t_r=1024 (full RRPRAM, not truncated)
 | Best loss | 0.53 | — |
 | Training time | 3.6h on 8× A100 | — |
 | EN generation | Coherent, grammatical | — |
-| RU generation | Coherent, full sentences | — |
+| RU generation | Present but weak, undertrained | — |
 
 After SFT on [Yent](https://github.com/ariannamethod/yent) personality dataset (6973 bilingual pairs):
 - Loss: 1.18 → 0.35 (continue-SFT)
@@ -339,7 +339,7 @@ Weight format: `[8 × int32 header: V,E,H,D,B,M,T,t_r]` + raw float32 (DoE-style
 
 ### Tokenizer
 
-SentencePiece BPE 32K bilingual:
+SentencePiece BPE 32K (EN/RU):
 - EN: 1.20 tok/word
 - RU: 1.45 tok/word
 
