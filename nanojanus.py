@@ -180,6 +180,29 @@ ext_vocab = []   # list of {'word': str, 'bpe_ids': list[int], 'from_hardcoded':
 ext_vocab_n = 0
 has_weights = False  # set True after load_weights succeeds
 
+SUFFIX_FRAGMENTS = {
+    # Original morphemes
+    "ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+    "ist","ity","ght","est","ter","ther","ted","ting","ally","ling",
+    # Confirmed BPE fragments from cascade output (not English words)
+    "ough","ital","ard","ently","cre","ely","ary","ily","ious",
+    "ation","able","ible","ish","ize","ise","ance","ence","ency",
+    "ancy","ory","ery","ure","edly","erly","enly","ably","ibly",
+    # Short BPE junk seen in output (verified not real words)
+    "ith","ald","ond","und","ung","urg","arn","ulf","olf",
+    "ect","ict","uct","ept","ipt","aft","eft","ift","oft",
+    "ult","olt","ilt","ust","ost","ying",
+}
+
+def _looks_like_fragment(word):
+    """Check if a word looks like a BPE fragment rather than a real word."""
+    if word in SUFFIX_FRAGMENTS:
+        return True
+    vowels = set("aeiou")
+    if not any(c in vowels for c in word):
+        return True
+    return False
+
 
 def bpe_decode_token(token_id):
     """Decode a single BPE token ID back to its string.
@@ -235,9 +258,7 @@ def build_extended_vocab():
                   "too","from","into","also","just","only","very","about","after","before","between",
                   "over","under","with","without","through","during","its","his","her","their","thing",
                   "things","something","nothing","everything","anything","here","there","where","now"}
-        _SUFFIXES = {"ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
-                     "ist","ity","ght","est","ter","ther","ted","ting","ally","ling"}
-        if s in _STOPS or s in _SUFFIXES:
+        if s in _STOPS or _looks_like_fragment(s):
             continue
         bpe_ids = bpe_encode(s)
         ext_vocab.append({'word': s, 'bpe_ids': bpe_ids, 'from_hardcoded': False})
@@ -246,7 +267,7 @@ def build_extended_vocab():
 
     ext_vocab_n = len(ext_vocab)
     n_hardcoded = NWORDS
-    print(f'extended vocab: {ext_vocab_n} words ({n_hardcoded} hardcoded + {bpe_added} from BPE)')
+    print(f'extended vocab: {ext_vocab_n} words ({n_hardcoded} hardcoded + {bpe_added} from BPE)', file=sys.stderr)
 
 
 def load_vocabulary(vocab_path):
@@ -822,11 +843,27 @@ def select_word(bpe_context, word_context, prev_word, step_idx, forbidden, direc
 
     r = random.random()
     cum = 0.0
+    sel = top[0]
     for s in top:
         cum += s['prob']
         if cum >= r:
-            return s
-    return top[0]
+            sel = s
+            break
+
+    # Validate: if extended vocab pick looks like a fragment, resample from hardcoded
+    if has_weights and sel['idx'] >= NWORDS and _looks_like_fragment(sel['word']):
+        hardcoded_top = [s for s in top if s['idx'] < NWORDS and s['word'] not in forbidden_words]
+        if hardcoded_top:
+            htotal = sum(s['prob'] for s in hardcoded_top) + 1e-9
+            r2 = random.random() * htotal
+            cum2 = 0.0
+            for s in hardcoded_top:
+                cum2 += s['prob']
+                if cum2 >= r2:
+                    sel = s
+                    break
+
+    return sel
 
 
 # ===================================================================
@@ -1324,15 +1361,15 @@ def load_weights(path=WEIGHTS_FILE):
         # Read and validate header
         hdr = struct.unpack('<8i', f.read(32))
         if hdr[0] != PEN7_MAGIC:
-            print(f'Warning: invalid PEN7 magic in {path} (got 0x{hdr[0]:08X})')
+            print(f'Warning: invalid PEN7 magic in {path} (got 0x{hdr[0]:08X})', file=sys.stderr)
             return False
         if hdr[1] != BPE_VOCAB or hdr[3] != DIM or hdr[4] != HDIM or \
            hdr[5] != N_HEADS or hdr[6] != N_LAYERS or hdr[7] != MAX_SEQ:
-            print(f'Warning: architecture mismatch in {path}')
+            print(f'Warning: architecture mismatch in {path}', file=sys.stderr)
             print(f'  file: BPE={hdr[1]} DIM={hdr[3]} HDIM={hdr[4]} '
-                  f'HEADS={hdr[5]} LAYERS={hdr[6]} SEQ={hdr[7]}')
+                  f'HEADS={hdr[5]} LAYERS={hdr[6]} SEQ={hdr[7]}', file=sys.stderr)
             print(f'  want: BPE={BPE_VOCAB} DIM={DIM} HDIM={HDIM} '
-                  f'HEADS={N_HEADS} LAYERS={N_LAYERS} SEQ={MAX_SEQ}')
+                  f'HEADS={N_HEADS} LAYERS={N_LAYERS} SEQ={MAX_SEQ}', file=sys.stderr)
             return False
 
         # Global weights
@@ -1376,7 +1413,7 @@ def load_weights(path=WEIGHTS_FILE):
                 prophecy_debt = pd
 
     has_weights = True
-    print(f'Weights loaded from {path} (PEN7 format)')
+    print(f'Weights loaded from {path} (PEN7 format)', file=sys.stderr)
     return True
 
 
@@ -1432,7 +1469,7 @@ def main():
     n_params = total_param_count()
     print(f'[nanojanus] resonance engine: {NWORDS} words, BPE {BPE_VOCAB}, '
           f'{N_LAYERS} layers, {N_HEADS} heads, DIM={DIM}, '
-          f'{n_params} params ({n_params/1e6:.1f}M)')
+          f'{n_params} params ({n_params/1e6:.1f}M)', file=sys.stderr)
 
     if args.generate:
         seed_word, seed_idx, fwd_steps, back_steps = run_chain(args.generate)
